@@ -52,9 +52,12 @@ Declare PR work at creation with `--completion-contract OWNER/REPO` (or an exact
 accepts the same `completion_contract`. Use `local-only` for intentionally local
 work; existing and undeclared cards retain that default. Prose URLs are not policy.
 
-After publishing, pass `metadata.published_pr` to completion. The first matching
-URL binds the card permanently; retries cannot substitute a green sibling PR.
-CLI `show --json` and `kanban_show` expose the persisted contract.
+After publishing, pass `metadata.published_pr` to completion — that exact key, not
+`pr_url` or `pr`, which are rejected with an actionable error rather than guessed
+at. The first matching URL binds the card permanently; retries cannot substitute a
+green sibling PR. A `kanban_request_review` handoff carrying `published_pr` pins it
+too, so the reviewer approving the card does not have to republish it. CLI
+`show --json` and `kanban_show` expose the persisted contract.
 
 The shared `complete_task` boundary covers worker tools, CLI, review approval and
 dashboard completion. It reads classic branch protection and active ruleset
@@ -62,13 +65,36 @@ required contexts, paginates exact-head check runs and legacy statuses, then
 re-reads the PR head/base. Optional failed/skipped telemetry does not veto accepted
 required checks. Missing, pending, failed, cancelled, timed-out, stale, skipped or
 neutral **required** evidence cannot complete the card. Neither can zero-run
-acceptance, unreadable policy or GitHub API failures. A repository without required
-checks needs a local-only contract. `gh` must be authenticated with read access to
-the repository's checks and rules; no remote writes are performed by this gate.
+acceptance or GitHub API failures. `gh` must be authenticated with read access to
+the repository's checks; no remote writes are performed by this gate.
+
+### Declaring required checks (private repositories on a free plan)
+
+The Repository Rules API answers `403` on a private repository without a paid plan,
+and such a repository exposes no `branchProtectionRule` either — so GitHub reports no
+policy the gate could judge the PR against. Declare the policy yourself:
+
+```yaml
+kanban:
+  completion_checks:
+    "acme/repo":
+      required_checks: ["build", "unit-tests"]
+```
+
+Each declared check must exist on the PR's exact head **and** be successful. The
+declaration is unioned with whatever GitHub policy *is* readable, and an unreadable
+Rules endpoint no longer stops the checks read — the receipt records it as
+unavailable and acceptance rests on the declared list. A repository with neither a
+readable GitHub policy nor an entry here can never satisfy a repository contract:
+"every check that happened to run is green" is deliberately **not** accepted as a
+substitute for a declared policy. Use a `local-only` contract for non-CI work.
 
 Rejection retains the active card and workspace. Durable `pr_acceptance` events
-store PR URL, SHA, required contexts, check IDs/URLs, classifications and recovery
-instructions; `last_failure_error` surfaces the next step. Fix failures, rerun
+store PR URL, SHA, required contexts and where each was declared, check IDs/URLs,
+classifications and recovery instructions, plus the phase collection stopped at —
+so "Rules was unreadable", "the checks endpoint returned nothing" and "we never got
+as far as asking CI" stay distinguishable instead of all reading as `checks: []`.
+`last_failure_error` surfaces the next step. Fix failures, rerun
 infrastructure checks or wait, then retry completion. Use `kanban_block` when
 human action is needed. Generic GitHub `failure` cannot establish whether a test
 or artifact upload failed; inspect its retained URL. Explicit infrastructure
