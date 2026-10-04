@@ -986,7 +986,10 @@ CREATE TABLE IF NOT EXISTS integration_gates (
     repository_path        TEXT NOT NULL,
     integration_remote     TEXT NOT NULL DEFAULT 'origin',
     integration_branch     TEXT NOT NULL DEFAULT 'develop',
-    -- 1 = a GitHub Bot actor may not be the merger (the default).
+    -- Retired knob, kept so a board written by an earlier build opens
+    -- unchanged. NOTHING reads it: a human merger is mandatory for every gate,
+    -- so a row that stored 0 is still gated on a human (the store's SELECT
+    -- omits the column and its writes pin it back to 1).
     require_human_merge    INTEGER NOT NULL DEFAULT 1,
     created_at             INTEGER NOT NULL DEFAULT 0,
     CHECK (require_human_merge IN (0, 1)),
@@ -3217,6 +3220,11 @@ def request_review(
     pinned from ``metadata["published_pr"]`` here, in this transaction, so the
     reviewer's ``complete_task`` needs no republication; the wrong key raises
     :class:`~hermes_cli.kanban_pr_acceptance_store.PublishedPrBindingError`.
+    The pin happens only once the transition's own compare-and-swap has WON, so
+    a refused handoff — stale ``expected_run_id``, a status that is not
+    running/ready, a lost claim race, unsatisfied parents, a live claim, or
+    missing reviewer provenance — leaves ``completion_contract`` and the event
+    log exactly as it found them.
 
     ``metadata["artifacts"]`` names the handoff's deliverable
     files; a review handoff is the last implementer transition, and the
@@ -3263,12 +3271,6 @@ def request_review(
                     "override) instead of clearing the live run's claim",
                 )
             implementer = trow["assignee"]
-            # Pin the card's exact PR from THIS handoff: the implementer is the
-            # only actor that knows the URL, and the reviewer's completion is
-            # what the acceptance gate runs for. Raises (rolling the whole
-            # transition back, task still ``running`` and retryable) when the
-            # handoff names a PR under the wrong key or from another repo.
-            bind_published_pr(conn, task_id, metadata, run_id=trow["current_run_id"])
             if reviewer is None:
                 reviewer = _prior_reviewer(conn, task_id)
                 if reviewer is False:
@@ -3301,6 +3303,18 @@ def request_review(
                 return _ret(
                     False, "task is not in running/ready (or expected_run_id did not match the current run)",
                 )
+            # Pin the card's exact PR from THIS handoff: the implementer is the
+            # only actor that knows the URL, and the reviewer's completion is
+            # what the acceptance gate runs for. Deliberately AFTER the CAS
+            # above: every refusal in this function returns normally, and a
+            # normal return out of ``write_txn`` COMMITS — so binding before the
+            # transition won, or before the reviewer provenance resolved, would
+            # let a refused handoff still pin the card's PR permanently (and
+            # append ``pr_pinned``) on a run it never owned. Raising here
+            # instead rolls the whole transition back (task still ``running``
+            # and retryable), which is what the wrong key or another repo's PR
+            # must do.
+            bind_published_pr(conn, task_id, metadata, run_id=trow["current_run_id"])
             if isinstance(metadata, dict):
                 staged_copies = _stage_completion_artifacts(
                     conn, task_id, metadata, now, uploaded_by="kanban_request_review",

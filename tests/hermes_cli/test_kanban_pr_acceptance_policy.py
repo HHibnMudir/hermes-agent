@@ -4,7 +4,10 @@ Regression for the two reproduced defects: Repository Rules was read BEFORE
 Check Runs and its 403 on a private/free repository aborted collection (the
 receipt then claimed ``checks: []`` as if CI had reported nothing), and the
 exact PR had to be re-supplied on the reviewer's completion because nothing
-bound it at the implementer's review handoff.
+bound it at the implementer's review handoff. Plus the follow-up defect in the
+fix for the second: the binding ran BEFORE ``request_review``'s own
+compare-and-swap, and since a normal ``return`` out of ``write_txn`` commits, a
+refused handoff could still pin the card's PR permanently.
 
 GitHub is mocked at ``kanban_pr_acceptance._api`` — the single process
 boundary the gate talks to GitHub through — so the real collector, the real
@@ -20,6 +23,7 @@ import pytest
 import yaml
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_pr_acceptance as pra
 from hermes_cli.kanban_db_connect import connect_closing
 from hermes_cli.kanban_pr_acceptance_store import PublishedPrBindingError
@@ -139,6 +143,12 @@ def _receipt(conn, task_id):
 
 def _card(conn, *, contract="acme/repo", title="Publish"):
     return kb.create_task(conn, title=title, completion_contract=contract)
+
+
+def _pinned_events(conn, task_id):
+    return [json.loads(row["payload"]) for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_pinned' ORDER BY id",
+        (task_id,))]
 
 
 def test_rules_403_accepts_declared_green_check_and_separates_its_evidence(github):
@@ -307,6 +317,97 @@ def test_review_handoff_pins_the_pr_so_the_reviewer_completes_without_repeating_
         assert kb.complete_task(conn, tid, summary="approved") is True
         receipt = _receipt(conn, tid)
     assert receipt["ok"] and receipt["pr_url"] == PR_URL
+
+
+def _refused_handoff(conn, refusal):
+    """A card whose next ``request_review`` must be refused, plus the kwargs that
+    refuse it. Every case leaves ``completion_contract`` un-pinned, so a binding
+    the refusal should not have made is visible as a changed contract."""
+    tid = _card(conn)
+    if refusal == "stale_run_id":
+        return tid, {"expected_run_id": 987654}
+    if refusal == "ineligible_status":
+        # ``blocked`` is not a source status for a review handoff.
+        assert kb.block_task(conn, tid, reason="waiting on an answer") is True
+        return tid, {}
+    if refusal == "live_claim":
+        assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
+        # This process stands in for the spawned worker: alive and fingerprinted.
+        kbd._set_worker_pid(conn, tid, os.getpid())
+        return tid, {}
+    if refusal == "unsatisfied_parent":
+        parent = kb.create_task(conn, title="parent that is not done")
+        kb.link_tasks(conn, parent, tid)
+        return tid, {}
+    # A re-review whose durable reviewer provenance is corrupt. The first handoff
+    # names no PR, so the contract is still the bare repository here; the card
+    # needs an assignee for ``request_changes`` to have an implementer to route
+    # back to.
+    conn.execute("UPDATE tasks SET assignee = 'builder' WHERE id = ?", (tid,))
+    conn.commit()
+    claimed = kb.claim_task(conn, tid)
+    assert kb.request_review(conn, tid, summary="v1", reviewer="reviewer",
+                             expected_run_id=claimed.current_run_id) is True
+    review = kb.claim_review_task(conn, tid)
+    assert kb.request_changes(conn, tid, reason="fix",
+                              expected_run_id=review.current_run_id)[0] is True
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET payload = '{}' WHERE task_id = ? "
+                     "AND kind = 'changes_requested'", (tid,))
+    retry = kb.claim_task(conn, tid, claimer="builder:retry")
+    return tid, {"expected_run_id": retry.current_run_id}
+
+
+@pytest.mark.parametrize("refusal", [
+    "stale_run_id", "ineligible_status", "live_claim", "unsatisfied_parent",
+    "no_reviewer_provenance",
+])
+def test_a_refused_review_handoff_never_pins_the_cards_pr(github, refusal):
+    """A normal ``return`` out of ``write_txn`` COMMITS.
+
+    So binding the exact PR before the transition's own compare-and-swap let a
+    handoff that was then refused still pin the card — permanently, since the
+    pin is immutable — from a run it never owned, and append a ``pr_pinned``
+    event claiming it did. Every refusal must leave the contract and the event
+    log exactly as it found them.
+    """
+    with connect_closing() as conn:
+        tid, kwargs = _refused_handoff(conn, refusal)
+        before = kb.get_task(conn, tid)
+
+        assert kb.request_review(conn, tid, summary="handoff",
+                                 metadata={"published_pr": PR_URL}, **kwargs) is False
+
+        after = kb.get_task(conn, tid)
+        assert after.completion_contract == before.completion_contract == "acme/repo"
+        assert after.status == before.status
+        assert _pinned_events(conn, tid) == []
+    # Nothing about a refused handoff talks to GitHub either.
+    assert github.calls == []
+
+
+def test_the_pin_still_happens_on_the_handoff_that_is_accepted(github):
+    """The fence must not cost the feature: once the CAS wins, the PR is pinned
+    in that same transaction, so the reviewer never repeats the URL."""
+    _declare_checks({"acme/repo": {"required_checks": ["ci/test"]}})
+    github.rules_forbidden = True
+    github.run("ci/test", "success")
+    with connect_closing() as conn:
+        tid = _card(conn)
+        # Refused first, on a run the card never had.
+        assert kb.request_review(conn, tid, summary="v1", metadata={"published_pr": PR_URL},
+                                 expected_run_id=987654) is False
+        assert kb.get_task(conn, tid).completion_contract == "acme/repo"
+
+        claimed = kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, summary="v1", reviewer="reviewer",
+                                 metadata={"published_pr": PR_URL},
+                                 expected_run_id=claimed.current_run_id) is True
+        assert kb.get_task(conn, tid).completion_contract == PR_URL
+        # Exactly one binding, on the run that actually made the handoff.
+        assert [p["pr_url"] for p in _pinned_events(conn, tid)] == [PR_URL]
+        assert kb.complete_task(conn, tid, summary="approved") is True
+        assert _receipt(conn, tid)["ok"] is True
 
 
 def test_pr_named_under_the_wrong_key_is_an_explicit_error_on_both_transitions(github):

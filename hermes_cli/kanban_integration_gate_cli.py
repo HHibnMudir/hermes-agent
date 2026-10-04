@@ -36,14 +36,13 @@ def _cmd_configure(args: argparse.Namespace) -> int:
             implementation_task_id=args.implementation, qa_task_id=args.qa,
             repository_path=args.repo, integration_remote=args.remote,
             integration_branch=args.branch,
-            require_human_merge=not getattr(args, "allow_bot_merge", False),
         )
     if _json_out(args, config.as_dict()):
         return 0
     print(f"Integration gate configured on {config.gate_task_id}.")
     for line in _config_lines(config):
         print(line)
-    print(f"  The gate completes only once its PR is merged into "
+    print(f"  The gate completes only once its PR is merged by a human into "
           f"{config.integration_remote}/{config.integration_branch} and that merge commit is in "
           f"the fetched branch. Inspect with `hermes kanban integration-gate show "
           f"{config.gate_task_id}`.")
@@ -105,7 +104,8 @@ def _config_lines(config) -> list[str]:
         f"  qa:             {config.qa_task_id}",
         f"  repository:     {config.repository_path}",
         f"  integration:    {config.integration_remote}/{config.integration_branch}",
-        f"  human merge:    {'required' if config.require_human_merge else 'not required'}",
+        # Stated on every gate, not conditional: there is no opt-out to report.
+        "  human merge:    required (always; a bot merger can never satisfy a gate)",
     ]
 
 

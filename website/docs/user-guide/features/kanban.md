@@ -136,7 +136,10 @@ Completing the gate card verifies, and refuses unless it can prove, all of:
 3. QA's `metadata.revision` equals the exact head the PR acceptance receipt passed;
 4. the Implementation card is pinned to an exact PR, and that PR is **merged**;
 5. its base is the configured integration branch;
-6. the merger is a human, unless `--allow-bot-merge` was given;
+6. the merger is a **human** — mandatory for every gate, with no flag, config key
+   or stored column that relaxes it (a bot merging its own unreviewed work is the
+   failure the gate exists to catch), and an actor GitHub reports as a `Bot`, with
+   a `…[bot]` login, or not at all fails closed;
 7. `git fetch <remote> <branch>` succeeds in the configured clone;
 8. the PR's `merge_commit_sha` is an ancestor of the fetched
    `refs/remotes/<remote>/<branch>` — the *merge commit*, because a squash merge
@@ -155,6 +158,18 @@ listing every condition and the one it stopped at. Inspect it with
 `hermes kanban integration-gate show <gate-card>` (or `list`, `rm`); board
 diagnostics surface the same thing, and deliberately separate "GitHub or git could
 not answer" (an operator problem) from "nobody has merged the PR yet" (just wait).
+A `git` that is missing, unusable or hung is also "could not prove", never "that
+commit is not in the branch".
+
+The GitHub and git work runs with no SQLite transaction open, so every fact the
+verification approved from is fingerprinted beforehand and re-read inside the
+transaction that would complete the card: the gate's run and status, the
+declaration, both parents' statuses and runs, the implementation's pinned
+contract, its accepted `pr_acceptance` receipt, and the completed QA run's own
+summary and metadata. If any of them moved in between — `hermes kanban edit`
+rewriting the completed QA result, a re-declaration, a rival claim — the
+completion is refused rather than promoting the downstream card on evidence that
+no longer exists.
 
 ## Kanban vs. `delegate_task`
 
