@@ -121,6 +121,54 @@ guard, not OS isolation against arbitrary direct database writes. GitHub Enterpr
 is not covered. Related publication/lifecycle work: #91230, #84254, #52311; local
 verification and publication alone are not remote acceptance.
 
+## Integration gates (opt-in)
+
+A PR completion contract proves CI was green on the exact head. It does not prove
+anyone *merged* it — so a downstream card can start on work that only ever existed
+in a branch. An **integration gate** is an opt-in card that closes that gap:
+
+```
+Implementation ──┬──> QA ──┬──> Integration gate ──> downstream Implementation
+                 └─────────┘
+```
+
+Both the Implementation and QA cards must already be direct parents of the gate
+card (`hermes kanban link`), then:
+
+```bash
+hermes kanban integration-gate configure <gate-card> \
+  --implementation <impl-card> --qa <qa-card> \
+  --repo /abs/path/to/clone --remote origin --branch develop
+```
+
+Completing the gate card verifies, and refuses unless it can prove, all of:
+
+1. the Implementation and QA cards are `done`;
+2. QA's latest completed run carries structured `metadata.decision == "PASS"` —
+   prose saying "PASS" is never evidence;
+3. QA's `metadata.revision` equals the exact head the PR acceptance receipt passed;
+4. the Implementation card is pinned to an exact PR, and that PR is **merged**;
+5. its base is the configured integration branch;
+6. the merger is a human, unless `--allow-bot-merge` was given;
+7. `git fetch <remote> <branch>` succeeds in the configured clone;
+8. the PR's `merge_commit_sha` is an ancestor of the fetched
+   `refs/remotes/<remote>/<branch>` — the *merge commit*, because a squash merge
+   discards the PR head, which would otherwise make every squash unprovable.
+
+Anything that cannot be proven blocks the gate, so the downstream card is never
+promoted on unverified work. Nothing here merges, pushes or writes to GitHub.
+
+Configuring a gate writes one declaration row and an audit event — it never
+creates links, moves cards or changes status, so declaring one on a live board
+changes nothing until the gate card is completed. An empty declaration table is
+completely inert: cards with no gate keep ordinary done-parent promotion.
+
+Each attempt appends an immutable, secret-free `integration_acceptance` receipt
+listing every condition and the one it stopped at. Inspect it with
+`hermes kanban integration-gate show <gate-card>` (or `list`, `rm`); board
+diagnostics surface the same thing, and deliberately separate "GitHub or git could
+not answer" (an operator problem) from "nobody has merged the PR yet" (just wait).
+
 ## Kanban vs. `delegate_task`
 
 They look similar; they are not the same primitive.

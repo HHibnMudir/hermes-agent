@@ -100,7 +100,23 @@ zero outside a kanban task (footprint ladder rung 3).
   `db_dispatch`, `db_notify`, `db_graph` (task initialization and decomposition), `workspace`, ...). Verbs: `init, create, list (ls), show, assign, link,
   unlink, comment, attach, attachments, attach-rm, complete, request-review, request-changes,
   reopen-review, block, unblock, archive, tail`, plus `watch, stats, runs, log, assignees, heartbeat,
-  notify-*, dispatch, daemon, gc`. Argparse alias dispatch must accept both `list` and `ls` (root).
+  notify-*, dispatch, daemon, gc, integration-gate`. Argparse alias dispatch must accept both `list`
+  and `ls` (root).
+- **Completion gates — two, both opt-in, both fail closed.** `completion_contract` demands
+  exact-head green checks (`kanban_pr_acceptance*`); an `integration_gates` row
+  (`kanban_integration_gate*`) also demands a human merge into the configured branch, proving
+  `merge_commit_sha` — NOT the head, which a squash merge discards — an ancestor of the freshly
+  fetched remote branch. Each guards a real failure:
+  **Repository Rules is optional evidence** (403 on a private repo without a paid plan; reading it
+  before Check Runs aborted collection, so the receipt claimed `checks: []` as if CI were silent) —
+  required checks union branch protection + Rules + `kanban.completion_checks`, and
+  "all observed checks green" is never a substitute for a *declared* policy. The PR pins once from
+  `metadata.published_pr` at `request_review` and is then immutable; a near-miss key (`pr_url`, …)
+  raises rather than being guessed at, so a retry cannot swap in a green sibling. Network/git work
+  stays OUTSIDE the write txn with the board snapshot rechecked inside it; refusals persist a
+  secret-free immutable receipt (never gh/git stderr); "the API could not answer" stays distinct
+  from "not merged yet" (`UNPROVABLE_PHASES`). Empty `integration_gates` is inert — legacy links
+  keep plain done-parent semantics.
 - **Toolset:** `tools/kanban_tools.py` — `kanban_show, kanban_complete, kanban_request_review,
   kanban_request_changes, kanban_block, kanban_schedule, kanban_heartbeat, kanban_comment,
   kanban_create, kanban_link,

@@ -28,6 +28,7 @@ from hermes_cli.kanban_output import (
     _task_to_dict,
 )
 from hermes_cli.kanban_boards import _dispatch_boards
+from hermes_cli.kanban_integration_gate_cli import _dispatch_integration_gate
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
@@ -1323,6 +1324,7 @@ _HANDLERS = {
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
+    "integration-gate": _dispatch_integration_gate,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
