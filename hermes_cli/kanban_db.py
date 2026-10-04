@@ -6,7 +6,8 @@ another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_K
 file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
-locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
+locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs,
+integration_gates (opt-in; see ``kanban_integration_gate_store``).
 """
 
 from __future__ import annotations
@@ -969,6 +970,32 @@ CREATE TABLE IF NOT EXISTS task_links (
     PRIMARY KEY (parent_id, child_id)
 );
 
+-- Opt-in integration gate (``hermes kanban integration-gate configure``). A
+-- gate card sits below an Implementation card and its QA card and above the
+-- next Implementation card; completing it asserts that the implementation QA
+-- passed is actually integrated into the configured branch. Legacy/untyped
+-- ``task_links`` keep their plain done/archived-parent semantics — an EMPTY
+-- table is completely inert, which is the whole point of the opt-in: no card
+-- changes behaviour until a row names it. The row is a declaration only;
+-- configuring one never creates links or moves cards.
+CREATE TABLE IF NOT EXISTS integration_gates (
+    gate_task_id           TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    implementation_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    qa_task_id             TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    -- Absolute path to the local clone the merge commit is proved against.
+    repository_path        TEXT NOT NULL,
+    integration_remote     TEXT NOT NULL DEFAULT 'origin',
+    integration_branch     TEXT NOT NULL DEFAULT 'develop',
+    -- 1 = a GitHub Bot actor may not be the merger (the default).
+    require_human_merge    INTEGER NOT NULL DEFAULT 1,
+    created_at             INTEGER NOT NULL DEFAULT 0,
+    CHECK (require_human_merge IN (0, 1)),
+    CHECK (implementation_task_id <> gate_task_id AND qa_task_id <> gate_task_id
+           AND implementation_task_id <> qa_task_id),
+    CHECK (length(repository_path) > 0 AND length(integration_remote) > 0
+           AND length(integration_branch) > 0)
+);
+
 CREATE TABLE IF NOT EXISTS task_comments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
@@ -1066,6 +1093,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_gates_implementation  ON integration_gates(implementation_task_id);
+CREATE INDEX IF NOT EXISTS idx_gates_qa              ON integration_gates(qa_task_id);
 """
 
 
@@ -2673,11 +2702,20 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+
+    Two opt-in gates can refuse the transition, each proving its evidence
+    outside the write txn and rechecking its snapshot inside it: a GitHub
+    completion contract (``pr_acceptance``) and a declared integration gate
+    (``integration_acceptance``). Both persist a receipt on refusal and leave
+    the card in place, so a refused gate never promotes a child.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    from hermes_cli.kanban_integration_gate_store import (
+        prepare_integration_gate, record_integration_gate,
+    )
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     metadata = _merge_completion_prose_artifacts(
@@ -2687,12 +2725,19 @@ def complete_task(
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
+    # Declared integration gates verify GitHub + git OUTSIDE the write txn; a
+    # card with no declaration is unaffected (None).
+    gate = prepare_integration_gate(conn, task_id, expected_run_id)
+    if gate is False:
+        return False
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
+            return False
+        if gate is not None and not record_integration_gate(conn, task_id, gate):
             return False
         trow = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
@@ -3732,6 +3777,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+    conn.execute(
+        "DELETE FROM integration_gates WHERE gate_task_id = ? "
+        "OR implementation_task_id = ? OR qa_task_id = ?", (task_id, task_id, task_id),
+    )
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
