@@ -3436,6 +3436,11 @@ def request_review(
     claim is only cleared with proof of ownership (``expected_run_id``) or
     ``force=True``. Returns ``bool``, or ``(ok, reason)`` with ``with_reason``.
 
+    A card whose ``completion_contract`` names a repository has its exact PR
+    pinned from ``metadata["published_pr"]`` here, in this transaction, so the
+    reviewer's ``complete_task`` needs no republication; the wrong key raises
+    :class:`~hermes_cli.kanban_pr_acceptance_store.PublishedPrBindingError`.
+
     ``metadata["artifacts"]`` names the handoff's deliverable
     files; a review handoff is the last implementer transition, and the
     *reviewer's* completion is what cleans the managed scratch workspace up, so
@@ -3445,6 +3450,8 @@ def request_review(
     :class:`ArtifactPreservationError`, rolling the whole transition back: the
     task stays ``running`` and retryable, with no attachments and no event.
     """
+
+    from hermes_cli.kanban_pr_acceptance_store import bind_published_pr
 
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
@@ -3478,6 +3485,12 @@ def request_review(
                     "(worker ownership) or force=True (explicit operator "
                     "override) instead of clearing the live run's claim",
                 )
+            # Pin the card's exact PR from THIS handoff: the implementer is the
+            # only actor that knows the URL, and the reviewer's completion is
+            # what the acceptance gate runs for. Raises (rolling the whole
+            # transition back, task still ``running`` and retryable) when the
+            # handoff names a PR under the wrong key or from another repo.
+            bind_published_pr(conn, task_id, metadata, run_id=trow["current_run_id"])
             if reviewer is None:
                 reviewer = _prior_reviewer(conn, task_id)
                 if reviewer is False:

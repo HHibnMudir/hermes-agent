@@ -1954,6 +1954,18 @@ DEFAULT_CONFIG = {
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.
         "reconcile_orphans": True,
+        # Required CI checks per repository for cards whose `completion_contract` names a GitHub
+        # repo or exact PR. Keys are "OWNER/REPO"; each entry declares the checks that must exist
+        # on the PR's exact head AND be successful before completion is accepted. GitHub's own
+        # policy (classic branch protection + Repository Rules) is read first and unioned with
+        # this; the declaration is what makes a private repo on a free plan completable, since
+        # the Rules API answers 403 there. A repo with neither a readable GitHub policy nor an
+        # entry here can never satisfy a repository contract — all-green-observed is deliberately
+        # NOT a substitute for a declared policy. Use a `local-only` contract for non-CI work.
+        #   completion_checks:
+        #     "acme/repo":
+        #       required_checks: ["build", "unit-tests"]
+        "completion_checks": {},
         # Notify subscriptions survive `done` (completion is reversible) and are removed on archive.
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
         # activity for this many days so stale rows aren't scanned forever. 0 = off.
