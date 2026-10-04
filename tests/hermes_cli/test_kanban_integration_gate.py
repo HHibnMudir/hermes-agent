@@ -194,15 +194,14 @@ def _passing_qa(conn, parent, *, decision="PASS", revision=HEAD, summary="QA don
     return tid
 
 
-def _gate(conn, clone, impl, qa, *, branch="develop", remote="origin",
-          require_human_merge=True, title="Integrate"):
+def _gate(conn, clone, impl, qa, *, branch="develop", remote="origin", title="Integrate"):
     gate_id = kb.create_task(conn, title=title)
     kb.link_tasks(conn, impl, gate_id)
     kb.link_tasks(conn, qa, gate_id)
     gates.configure_gate(
         conn, gate_id, implementation_task_id=impl, qa_task_id=qa,
         repository_path=str(clone.path), integration_remote=remote,
-        integration_branch=branch, require_human_merge=require_human_merge,
+        integration_branch=branch,
     )
     return gate_id
 
@@ -362,17 +361,75 @@ def test_a_bot_merge_blocks_the_gate_under_the_human_policy(github, clone, actor
     assert receipt["phase"] == "human_merge_actor"
 
 
-def test_the_same_bot_merge_is_accepted_once_the_policy_opts_out(github, clone):
-    """``--allow-bot-merge`` is the only thing that changes the verdict."""
+def test_nothing_can_opt_a_gate_out_of_the_human_merge(github, clone):
+    """The human merger is MANDATORY: there is no flag, no keyword and no stored
+    column that accepts a bot merge, because automation merging its own
+    unreviewed work is the failure the gate exists to catch."""
     with connect_closing() as conn:
         impl = _accepted_implementation(conn, github)
         qa = _passing_qa(conn, impl)
-        gate_id = _gate(conn, clone, impl, qa, require_human_merge=False)
+        gate_id = _gate(conn, clone, impl, qa)
         github.merge(clone.commit("squash merge of #7"),
                      merged_by={"login": "github-actions[bot]", "type": "Bot"})
-        assert kb.complete_task(conn, gate_id, summary="gate completion") is True
+
+        # No caller-side opt-out exists at any layer.
+        with pytest.raises(TypeError):
+            gates.configure_gate(conn, gate_id, implementation_task_id=impl, qa_task_id=qa,
+                                 repository_path=str(clone.path), require_human_merge=False)
+
+        assert kb.complete_task(conn, gate_id, summary="gate completion") is False
         receipt = _receipt(conn, gate_id)
-    assert receipt["ok"] and _condition(receipt, "human_merge_actor")["ok"]
+    assert receipt["phase"] == "human_merge_actor"
+    assert receipt["require_human_merge"] is True
+    assert "always requires a human merger" in _condition(receipt, "human_merge_actor")["detail"]
+
+
+def test_a_row_stored_with_the_retired_opt_out_is_still_gated_on_a_human(github, clone):
+    """Defensive against a board an earlier build wrote: the declaration column
+    survives for schema compatibility, but a stored ``0`` must not weaken the
+    gate — nothing reads it, and re-declaring repairs the row."""
+    with connect_closing() as conn:
+        impl = _accepted_implementation(conn, github)
+        qa = _passing_qa(conn, impl)
+        gate_id = _gate(conn, clone, impl, qa)
+        conn.execute("UPDATE integration_gates SET require_human_merge = 0 WHERE gate_task_id = ?",
+                     (gate_id,))
+        conn.commit()
+        assert gates.get_gate(conn, gate_id).require_human_merge is True
+
+        github.merge(clone.commit("squash merge of #7"),
+                     merged_by={"login": "release-bot", "type": "Bot"})
+        assert kb.complete_task(conn, gate_id, summary="gate completion") is False
+        assert kb.get_task(conn, gate_id).status != "done"
+        assert _receipt(conn, gate_id)["phase"] == "human_merge_actor"
+
+        # Re-declaring writes the mandatory value back over the legacy one.
+        gates.configure_gate(conn, gate_id, implementation_task_id=impl, qa_task_id=qa,
+                             repository_path=str(clone.path))
+        assert conn.execute(
+            "SELECT require_human_merge FROM integration_gates WHERE gate_task_id = ?",
+            (gate_id,)).fetchone()[0] == 1
+
+
+def test_the_cli_offers_no_bot_merge_bypass(github, clone):
+    """The retired ``--allow-bot-merge`` must not come back as a public flag."""
+    from hermes_cli import kanban as kc
+
+    with connect_closing() as conn:
+        impl = _accepted_implementation(conn, github)
+        qa = _passing_qa(conn, impl)
+        gate_id = kb.create_task(conn, title="Integrate")
+        kb.link_tasks(conn, impl, gate_id)
+        kb.link_tasks(conn, qa, gate_id)
+
+    base = (f"integration-gate configure {gate_id} --implementation {impl} --qa {qa} "
+            f"--repo {clone.path}")
+    refused = kc.run_slash(f"{base} --allow-bot-merge")
+    assert "usage error" in refused and "unrecognized arguments" in refused
+    assert "--allow-bot-merge" not in kc.run_slash("integration-gate configure --help")
+
+    assert "Integration gate configured" in kc.run_slash(base)
+    assert "human merge:    required (always" in kc.run_slash(f"integration-gate show {gate_id}")
 
 
 @pytest.mark.parametrize("sha", [None, "", "not-a-sha", "a" * 39, "z" * 40])
@@ -437,6 +494,77 @@ def test_an_undecidable_ancestry_question_is_unprovable_not_a_denial(github, clo
         receipt = _receipt(conn, gate_id)
     assert receipt["phase"] == "ancestry_unprovable"
     assert receipt["phase"] in UNPROVABLE_PHASES
+
+
+@pytest.mark.parametrize("break_git", ["missing_binary", "timeout"])
+def test_git_being_unusable_is_a_decline_not_a_raise(clone, monkeypatch, break_git):
+    """``_git`` is the only thing standing between a missing git binary (or a
+    hung fetch) and a traceback out of ``complete_task``. Both must come back
+    as a non-zero result the caller can turn into an unproven condition — and
+    never as exit 1, which ``is-ancestor`` means as "decided: no"."""
+    from hermes_cli import kanban_integration_gate as gate
+
+    if break_git == "missing_binary":
+        monkeypatch.setenv("PATH", "")
+    else:
+        monkeypatch.setattr(gate, "_GIT_TIMEOUT", 0)
+
+    result = gate._git(str(clone.path), "rev-parse", "HEAD")
+    assert result.returncode == gate._GIT_UNAVAILABLE != 1
+    assert not result.stdout and not result.stderr
+
+
+def test_an_unusable_git_blocks_the_gate_with_a_receipt(github, clone, monkeypatch):
+    """End to end: the decline above becomes a blocking receipt, and the gate
+    never claims the merge is absent from a branch it could not read."""
+    from hermes_cli import kanban_integration_gate as gate
+
+    with connect_closing() as conn:
+        impl = _accepted_implementation(conn, github)
+        qa = _passing_qa(conn, impl)
+        gate_id = _gate(conn, clone, impl, qa)
+        github.merge(clone.commit("squash merge of #7"))
+
+        monkeypatch.setattr(gate, "_GIT_TIMEOUT", 0)
+        assert kb.complete_task(conn, gate_id, summary="gate completion") is False
+        assert kb.get_task(conn, gate_id).status != "done"
+        receipt = _receipt(conn, gate_id)
+    assert receipt["phase"] == "fetch_failed"
+    assert receipt["phase"] in UNPROVABLE_PHASES
+    assert not any(c["name"] == "merge_commit_in_integration_branch"
+                   for c in receipt["conditions"])
+
+
+@pytest.mark.parametrize("merged_by", ["octocat", 42, [], {}])
+def test_an_unparseable_merger_fails_the_human_condition_closed(github, clone, merged_by):
+    """GitHub's merged_by is an object or null; anything else is "no known
+    actor", never an implicit human."""
+    with connect_closing() as conn:
+        impl = _accepted_implementation(conn, github)
+        qa = _passing_qa(conn, impl)
+        gate_id = _gate(conn, clone, impl, qa)
+        github.merge(clone.commit("squash merge of #7"))
+        github.merged_by = merged_by
+        assert kb.complete_task(conn, gate_id, summary="gate completion") is False
+        receipt = _receipt(conn, gate_id)
+    assert receipt["phase"] == "human_merge_actor"
+
+
+def test_a_malformed_acceptance_receipt_blocks_the_gate_instead_of_raising(github, clone):
+    """The accepted head is JSON read back off the event log; a non-string
+    there must not blow up the regex checks mid-completion."""
+    with connect_closing() as conn:
+        impl = _accepted_implementation(conn, github)
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE task_id = ? AND kind = 'pr_acceptance'",
+            (json.dumps({"ok": True, "head_sha": 12345, "pr_url": None}), impl))
+        conn.commit()
+        qa = _passing_qa(conn, impl)
+        gate_id = _gate(conn, clone, impl, qa)
+        github.merge(clone.commit("squash merge of #7"))
+        assert kb.complete_task(conn, gate_id, summary="gate completion") is False
+        receipt = _receipt(conn, gate_id)
+    assert receipt["phase"] == "accepted_head_known"
 
 
 def test_an_unreadable_pr_is_unprovable_and_never_waiting_for_merge(github, clone):
@@ -617,7 +745,8 @@ def test_configuring_a_gate_mutates_no_card_and_requires_the_real_parents(github
 
         config = gates.configure_gate(conn, gate_id, implementation_task_id=impl, qa_task_id=qa,
                                       repository_path=str(clone.path))
-        assert config.integration_branch == "develop" and config.require_human_merge is True
+        assert config.integration_branch == "develop"
+        assert config.require_human_merge is True
         # No card changed status or assignee, and no edge was created.
         for task_id, snapshot in before.items():
             now = kb.get_task(conn, task_id)
@@ -627,9 +756,8 @@ def test_configuring_a_gate_mutates_no_card_and_requires_the_real_parents(github
 
         # Re-declaring is an update, not a duplicate row.
         updated = gates.configure_gate(conn, gate_id, implementation_task_id=impl, qa_task_id=qa,
-                                       repository_path=str(clone.path), integration_branch="main",
-                                       require_human_merge=False)
-        assert updated.integration_branch == "main" and updated.require_human_merge is False
+                                       repository_path=str(clone.path), integration_branch="main")
+        assert updated.integration_branch == "main" and updated.require_human_merge is True
         assert len(gates.list_gates(conn)) == 1
 
         # Removing it returns the card to ordinary parent gating.
@@ -733,6 +861,59 @@ def test_a_board_change_during_verification_rejects_the_snapshot(github, clone, 
         assert _receipt(conn, gate_id) is None
 
 
+@pytest.mark.parametrize("mutation", ["qa_verdict", "qa_revision", "contract", "acceptance"])
+def test_mutating_the_evidence_during_verification_refuses_the_completion(github, clone, mutation):
+    """The evidence the gate approves from is MUTABLE while it reads GitHub.
+
+    Comparing only run ids and statuses was not enough:
+    ``edit_task(result=…)`` is the supported way to rewrite a completed
+    card's result, and it changes the completed QA run's summary and metadata
+    while leaving every id and status exactly as the snapshot recorded them. The
+    implementation's pinned contract and its accepted ``pr_acceptance`` receipt
+    are ordinary rows too. Each of these would otherwise let a gate complete —
+    and promote its downstream card — on a verdict, a reviewed revision or an
+    accepted head that no longer exists.
+    """
+    with connect_closing() as conn:
+        impl, qa, gate_id, child = _graph(conn, github, clone)
+        github.merge(clone.commit("squash merge of #7"))
+
+        def interfere():
+            with connect_closing() as rival:
+                if mutation == "qa_verdict":
+                    # Same run, same statuses — only the verdict flips.
+                    assert kb.edit_task(
+                        rival, qa, result="actually failing",
+                        metadata={"decision": "FAIL", "revision": HEAD}) is True
+                elif mutation == "qa_revision":
+                    assert kb.edit_task(
+                        rival, qa, result="reviewed something else",
+                        metadata={"decision": "PASS", "revision": OTHER_HEAD}) is True
+                elif mutation == "contract":
+                    rival.execute("UPDATE tasks SET completion_contract = ? WHERE id = ?",
+                                  ("https://github.com/acme/repo/pull/8", impl))
+                    rival.commit()
+                else:
+                    rival.execute(
+                        "UPDATE task_events SET payload = ? WHERE task_id = ? "
+                        "AND kind = 'pr_acceptance'",
+                        (json.dumps({"ok": True, "head_sha": OTHER_HEAD, "pr_url": PR_URL}), impl))
+                    rival.commit()
+
+        # Fires while the gate is reading GitHub, i.e. after prepare_* snapshotted.
+        github.hooks["/pulls/"] = interfere
+        assert kb.complete_task(conn, gate_id, summary="gate completion") is False
+
+        assert kb.get_task(conn, gate_id).status != "done"
+        assert kb.get_task(conn, child).status == "todo"
+        # No receipt at all, and in particular no accepted one: the evidence the
+        # verification would describe was never valid for the board as it stands.
+        receipts = [json.loads(r["payload"]) for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='integration_acceptance'",
+            (gate_id,))]
+        assert receipts == []
+
+
 def test_the_gate_holds_no_write_lock_while_it_reads_github_and_git(github, clone):
     """A concurrent writer must be able to commit mid-verification; if the gate
     held the board's write lock this would raise "database is locked"."""
@@ -803,6 +984,70 @@ def test_describe_receipt_shows_every_condition_and_the_stopping_point(github, c
     assert "merge commit:" in passed_text
 
     assert "none yet" in "\n".join(describe_receipt(None))
+
+
+def test_the_natural_complete_failure_names_the_gate_that_refused(github, clone):
+    """``hermes kanban complete`` on a refused gate used to say "unknown id or
+    terminal state", which is both wrong and the opposite of actionable — the
+    card exists and is perfectly completable, a condition just is not proven.
+    The real phase and recovery are already on the receipt the refusal wrote."""
+    from hermes_cli import kanban as kc
+
+    with connect_closing() as conn:
+        _, _, gate_id, _ = _graph(conn, github, clone)
+
+    waiting = kc.run_slash(f"complete {gate_id} --summary 'gate completion'")
+    assert "unknown id or terminal state" not in waiting
+    assert "integration gate refused — waiting_for_merge." in waiting
+    assert "is open and not merged." in waiting
+    assert "Merge the implementation PR" in waiting
+
+    # An unprovable refusal reports its own phase, not the merge-wait one.
+    github.pull_read_fails = True
+    unprovable = kc.run_slash(f"complete {gate_id} --summary 'gate completion'")
+    assert "integration gate refused — pr_unreadable." in unprovable
+    assert "gh authentication" in unprovable
+
+    # The generic message is still what a genuinely unknown id gets.
+    assert "unknown id or terminal state" in kc.run_slash("complete t_deadbeef --summary 'nothing here'")
+
+
+def test_a_pr_acceptance_refusal_also_reports_its_real_phase(github, clone):
+    """The same for the other completion gate: a red required check is reported
+    as a red required check."""
+    from hermes_cli import kanban as kc
+
+    github.check_runs = [{
+        "id": 43, "name": "ci/test", "head_sha": HEAD, "app": {"id": 1},
+        "status": "completed", "conclusion": "failure",
+        "html_url": "https://github.com/acme/repo/actions/runs/43",
+    }]
+    with connect_closing() as conn:
+        tid = kb.create_task(conn, title="Implementation", completion_contract="acme/repo")
+
+    refused = kc.run_slash(f"complete {tid} --summary 'implemented' --metadata '{{\"published_pr\": \"{PR_URL}\"}}'")
+    assert "unknown id or terminal state" not in refused
+    # The verdict, not just the phase collection happened to stop at.
+    assert "PR acceptance refused — failure at the " in refused
+    assert "Fix required failures" in refused
+
+
+def test_a_refusal_with_no_receipt_keeps_the_generic_message(github, clone):
+    """The receipt floor matters: a card refused for an ordinary reason must not
+    be explained with a gate receipt an EARLIER attempt left behind."""
+    from hermes_cli import kanban as kc
+
+    with connect_closing() as conn:
+        _, _, gate_id, _ = _graph(conn, github, clone)
+        assert kb.complete_task(conn, gate_id, summary="gate completion") is False  # leaves a receipt
+        assert _receipt(conn, gate_id) is not None
+        # Now refuse for a reason no gate explains: the gate is already done.
+        github.merge(clone.commit("squash merge of #7"))
+        assert kb.complete_task(conn, gate_id, summary="gate completion") is True
+
+    already_done = kc.run_slash(f"complete {gate_id} --summary 'gate completion'")
+    assert "unknown id or terminal state" in already_done
+    assert "refused" not in already_done
 
 
 def test_the_cli_declares_inspects_and_removes_a_gate(github, clone):

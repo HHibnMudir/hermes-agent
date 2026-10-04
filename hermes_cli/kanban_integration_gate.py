@@ -21,6 +21,7 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass
+from typing import ClassVar
 
 from hermes_cli.kanban_pr_acceptance import _API_FAILURES, _PR, _SHA
 
@@ -52,7 +53,16 @@ class GateConfig:
     repository_path: str
     integration_remote: str
     integration_branch: str
-    require_human_merge: bool
+
+    #: A human merger is MANDATORY for every declared gate — a class constant,
+    #: not a field, so there is no per-gate value to configure, persist, or get
+    #: wrong. Automation merging its own unreviewed work is precisely the
+    #: failure a gate exists to catch, so "a bot merged it" can never be the
+    #: thing that lets a downstream card start. Rows an earlier build wrote with
+    #: ``require_human_merge = 0`` are therefore read as mandatory-human too:
+    #: the store never reads that column (see
+    #: ``kanban_integration_gate_store._GATE_COLUMNS``).
+    require_human_merge: ClassVar[bool] = True
 
     def as_dict(self) -> dict:
         return {
@@ -62,6 +72,8 @@ class GateConfig:
             "repository_path": self.repository_path,
             "integration_remote": self.integration_remote,
             "integration_branch": self.integration_branch,
+            # Reported on every receipt and every ``show``: a reader of an old
+            # receipt should not have to guess whether the policy applied.
             "require_human_merge": self.require_human_merge,
         }
 
@@ -70,13 +82,31 @@ class GateConfig:
         return f"refs/remotes/{self.integration_remote}/{self.integration_branch}"
 
 
+#: Synthetic exit code for a git invocation that never produced one. 128 is
+#: git's own "fatal", and it reads as "could not decide" rather than the
+#: ``is-ancestor`` answer 1 ("decided: no") — the gate must not report a
+#: missing git binary or a hung fetch as "that commit is not in the branch".
+_GIT_UNAVAILABLE = 128
+
+
 def _git(repository_path: str, *args: str) -> subprocess.CompletedProcess:
-    """Run one git command in the gate's clone. Never raises on exit status —
-    the caller decides whether a non-zero code means "false" or "unprovable"."""
-    return subprocess.run(
-        ["git", "-C", repository_path, *args], stdin=subprocess.DEVNULL,
-        capture_output=True, text=True, timeout=_GIT_TIMEOUT, check=False,
-    )
+    """Run one git command in the gate's clone.
+
+    Never raises: a non-zero exit, a missing git binary and a timeout all come
+    back as a ``CompletedProcess`` so the caller decides whether the code means
+    "false" or "unprovable". Letting any of them escape would abort
+    ``complete_task`` with a traceback instead of the blocking receipt that
+    tells an operator which condition could not be proven.
+    """
+    try:
+        return subprocess.run(
+            ["git", "-C", repository_path, *args], stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=_GIT_TIMEOUT, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Never surface git's stderr/output (host and credential detail); the
+        # unproven condition is the actionable fact.
+        return subprocess.CompletedProcess(args, _GIT_UNAVAILABLE, stdout="", stderr="")
 
 
 def collect_gate_acceptance(config: GateConfig, board: dict) -> dict:
@@ -158,7 +188,9 @@ def collect_gate_acceptance(config: GateConfig, board: dict) -> dict:
                      "GitHub could not be read for the implementation PR, so nothing about its "
                      "merge state is known", phase="pr_unreadable"):
         return receipt
-    merged_by = pr.get("merged_by") or {}
+    # GitHub sends ``null`` for an unmerged PR; anything that is not an object
+    # is treated as "no known actor", which fails the human-merge condition.
+    merged_by = pr.get("merged_by") if isinstance(pr.get("merged_by"), dict) else {}
     receipt.update(
         base_ref=(pr.get("base") or {}).get("ref"),
         merge_commit_sha=pr.get("merge_commit_sha"),
@@ -175,11 +207,11 @@ def collect_gate_acceptance(config: GateConfig, board: dict) -> dict:
         f"{config.integration_branch!r}",
     ):
         return receipt
+    # Unconditional: no flag, config key or stored column can turn this off.
     if not condition(
-        "human_merge_actor",
-        not config.require_human_merge or _is_human_actor(merged_by),
+        "human_merge_actor", _is_human_actor(merged_by),
         f"PR {pr_url} was merged by {merged_by.get('login')!r} "
-        f"(type={merged_by.get('type')!r}); this gate requires a human merger",
+        f"(type={merged_by.get('type')!r}); an integration gate always requires a human merger",
     ):
         return receipt
     merge_sha = receipt["merge_commit_sha"]

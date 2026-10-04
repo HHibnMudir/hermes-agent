@@ -892,6 +892,62 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: 
     return None
 
 
+#: Receipt kinds the two opt-in completion gates append, and how to name them.
+_COMPLETION_GATE_EVENTS = {
+    "integration_acceptance": "integration gate",
+    "pr_acceptance": "PR acceptance",
+}
+
+
+def _latest_event_id(conn, task_id: str) -> int:
+    """Highest event id on the task right now — the floor that tells a receipt
+    written by THIS attempt apart from one left by an earlier one."""
+    row = conn.execute(
+        "SELECT MAX(id) AS id FROM task_events WHERE task_id = ?", (task_id,)).fetchone()
+    return int(row["id"] or 0) if row is not None else 0
+
+
+def _completion_refusal(conn, task_id: str, event_floor: int) -> Optional[str]:
+    """Why ``complete_task`` actually refused, when it left a receipt behind.
+
+    Both opt-in gates persist their receipt (and the card's
+    ``last_failure_error``) in the very transaction that refuses the transition,
+    so a receipt above ``event_floor`` belongs to this attempt — a leftover from
+    a previous one must never be reported as this one's reason. Without such a
+    receipt the caller keeps the generic message: the refusal really was an
+    unknown id, a terminal/ineligible status, unsatisfied parents or a lost run
+    race, none of which a gate explains.
+    """
+    row = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
+        f"AND kind IN ({', '.join('?' * len(_COMPLETION_GATE_EVENTS))}) ORDER BY id DESC LIMIT 1",
+        (task_id, event_floor, *_COMPLETION_GATE_EVENTS),
+    ).fetchone()
+    if row is None:
+        return None
+    receipt = kb._json_dict(row["payload"])
+    if receipt.get("ok"):
+        return None
+    label = _COMPLETION_GATE_EVENTS[row["kind"]]
+    phase = str(receipt.get("phase") or "").strip()
+    verdict = str(receipt.get("classification") or "").strip()
+    if verdict and verdict != phase:
+        # PR acceptance: the verdict is the answer and ``phase`` only records how
+        # far collection got (a red required check leaves it at the harmless
+        # ``stale_recheck``), so neither alone tells the operator what happened.
+        stop = verdict + (f" at the {phase} phase" if phase else "")
+    else:
+        stop = phase or "refused"
+    rest = [str(receipt.get(key) or "").strip() for key in ("detail", "recovery")]
+    if not any(rest):
+        # A receipt without prose still left the card's own rendering behind.
+        task = kb.get_task(conn, task_id)
+        rest = [(getattr(task, "last_failure_error", None) or "").strip() if task else ""]
+    return " ".join([f"cannot complete {task_id}: {label} refused — {stop}.",
+                     *(part if part.endswith((".", "!", "?")) else f"{part}."
+                       for part in rest if part)])
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids, rc = _require_ids(args)
@@ -918,6 +974,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = gate_err
                 return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
+            event_floor = _latest_event_id(conn, tid)
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
@@ -932,13 +989,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                                  f"describing what was done (an empty completion is not evidence).")
                 return False
             if not done:
-                # complete_task returns bare False for a dependency refusal too;
-                # name the open parents instead of claiming the id is unknown.
-                blockers = kb.unsatisfied_parents(conn, tid)
-                if blockers:
-                    detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
-                    fail_msg[tid] = (f"cannot complete {tid}: unsatisfied parent dependencies: {detail}; "
-                                     f"complete the parents first, or `hermes kanban unlink <parent> {tid}`.")
+                # A completion gate that refused left the real reason behind;
+                # "unknown id or terminal state" is for when nothing did.
+                refusal = _completion_refusal(conn, tid, event_floor)
+                if refusal:
+                    fail_msg[tid] = refusal
+                else:
+                    # complete_task returns bare False for a dependency refusal too;
+                    # name the open parents instead of claiming the id is unknown.
+                    blockers = kb.unsatisfied_parents(conn, tid)
+                    if blockers:
+                        detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
+                        fail_msg[tid] = (f"cannot complete {tid}: unsatisfied parent dependencies: {detail}; "
+                                         f"complete the parents first, or `hermes kanban unlink <parent> {tid}`.")
             return done
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)

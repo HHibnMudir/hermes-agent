@@ -1,18 +1,21 @@
 """Integration-gate declarations and the gate half of the terminal write.
 
 Owns the ``integration_gates`` rows and the snapshot discipline around
-:func:`~hermes_cli.kanban_integration_gate.collect_gate_acceptance`: the board
-facts the verification was computed from are captured first, the network and
-git work happens with no transaction open, and the snapshot is rechecked
-inside ``complete_task``'s write transaction before the terminal UPDATE. A
-run/status/config change in between rejects the attempt rather than promoting
-the gate's child on stale evidence.
+:func:`~hermes_cli.kanban_integration_gate.collect_gate_acceptance`: EVERY
+board fact the verification was computed from is fingerprinted first, the
+network and git work happens with no transaction open, and that fingerprint is
+re-read and compared inside ``complete_task``'s write transaction before the
+terminal UPDATE. Any change to the gate's run/status, the declaration, the
+parents, the implementation's contract, its accepted acceptance receipt, or the
+completed QA run's own summary/metadata rejects the attempt rather than
+promoting the gate's child on evidence that has since moved.
 
 ``complete_task`` stays the terminal transition owner; this module only
 answers "may it?" and records the receipt.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import astuple
@@ -22,9 +25,15 @@ from typing import Optional
 from hermes_cli.kanban_db_connect import write_txn
 from hermes_cli.kanban_integration_gate import GateConfig, collect_gate_acceptance
 
+#: The columns one declaration is read back from. ``require_human_merge`` is
+#: deliberately absent: the column still exists so a board written by an earlier
+#: build opens unchanged, but NOTHING reads it — a human merger is mandatory for
+#: every gate (:class:`~hermes_cli.kanban_integration_gate.GateConfig`), so a
+#: row that stored ``0`` must not be able to weaken one. Writes pin it back to
+#: ``1`` rather than leaving a stale value behind.
 _GATE_COLUMNS = (
     "gate_task_id, implementation_task_id, qa_task_id, repository_path, "
-    "integration_remote, integration_branch, require_human_merge"
+    "integration_remote, integration_branch"
 )
 #: Statuses ``complete_task`` accepts as a source for its terminal UPDATE.
 _COMPLETABLE = {"running", "ready", "blocked", "review"}
@@ -59,14 +68,13 @@ def _row_to_config(row) -> GateConfig:
         repository_path=row["repository_path"],
         integration_remote=row["integration_remote"],
         integration_branch=row["integration_branch"],
-        require_human_merge=bool(row["require_human_merge"]),
     )
 
 
 def configure_gate(
     conn, gate_task_id: str, *, implementation_task_id: str, qa_task_id: str,
     repository_path: str, integration_remote: str = "origin",
-    integration_branch: str = "develop", require_human_merge: bool = True,
+    integration_branch: str = "develop",
 ) -> GateConfig:
     """Declare (or re-declare) the gate on ``gate_task_id``.
 
@@ -75,6 +83,9 @@ def configure_gate(
     implicitly, so a missing edge is an error naming the ``hermes kanban link``
     that fixes it. Only the declaration row and an audit event are written —
     no card changes status, assignee or links.
+
+    There is no human-merge parameter: every gate requires a human merger, and
+    re-declaring one repairs a row an earlier build stored otherwise.
     """
     gate_task_id = _require_id(gate_task_id, "gate task id")
     implementation_task_id = _require_id(implementation_task_id, "implementation task id")
@@ -104,16 +115,18 @@ def configure_gate(
                     f"Configuring a gate never rewrites the board graph."
                 )
         conn.execute(
-            f"INSERT INTO integration_gates ({_GATE_COLUMNS}, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            f"INSERT INTO integration_gates ({_GATE_COLUMNS}, require_human_merge, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?) "
             "ON CONFLICT(gate_task_id) DO UPDATE SET "
             "implementation_task_id = excluded.implementation_task_id, "
             "qa_task_id = excluded.qa_task_id, repository_path = excluded.repository_path, "
             "integration_remote = excluded.integration_remote, "
             "integration_branch = excluded.integration_branch, "
-            "require_human_merge = excluded.require_human_merge",
+            # Pinned, never carried over: re-declaring repairs a row an earlier
+            # build wrote with the retired opt-out.
+            "require_human_merge = 1",
             (gate_task_id, implementation_task_id, qa_task_id, repo_path, remote, branch,
-             1 if require_human_merge else 0, int(time.time())),
+             int(time.time())),
         )
         config = get_gate(conn, gate_task_id)
         _append_event(conn, gate_task_id, "integration_gate_configured", config.as_dict())
@@ -165,36 +178,41 @@ def _validated_repository_path(value) -> str:
 
 def prepare_integration_gate(conn, task_id: str, expected_run_id: Optional[int]):
     """``None`` when the card is not a declared gate, ``False`` when the
-    caller's run/status snapshot is already lost, else ``(snapshot, receipt)``.
+    caller's run/status snapshot is already lost, else ``(fingerprint, receipt)``.
 
     The external verification runs here — deliberately BEFORE
     ``complete_task`` opens its write transaction, so no network or git call
     ever holds the board's write lock.
     """
-    config = get_gate(conn, task_id)
-    if config is None:
+    if get_gate(conn, task_id) is None:
+        # No declaration: an ordinary card, which the feature must not touch.
         return None
-    snapshot = _snapshot(conn, task_id)
-    if snapshot is None:
+    state = _gate_state(conn, task_id)
+    if state is None:
         return False
-    run_id, status = snapshot[0], snapshot[1]
+    fingerprint, evidence, config = state
+    run_id, status = fingerprint[0], fingerprint[1]
     if status not in _COMPLETABLE or (expected_run_id is not None and run_id != expected_run_id):
         return False
-    return snapshot, collect_gate_acceptance(config, _board_evidence(conn, config))
+    # The declaration verified against is the one the fingerprint covers.
+    return fingerprint, collect_gate_acceptance(config, evidence)
 
 
 def record_integration_gate(conn, task_id: str, prepared) -> bool:
     """Called under ``complete_task``'s write_txn, before its terminal UPDATE.
 
-    Persists the immutable receipt either way: a failed gate must leave
-    diagnostics behind without making the gate — or its child — executable.
+    Re-reads every fact the receipt was approved from and refuses unless all of
+    them are byte-for-byte what the verification saw. Persists the immutable
+    receipt either way: a failed gate must leave diagnostics behind without
+    making the gate — or its child — executable.
     """
     from hermes_cli.kanban_db import _append_event
 
-    snapshot, receipt = prepared
-    if _snapshot(conn, task_id) != snapshot:
+    fingerprint, receipt = prepared
+    state = _gate_state(conn, task_id)
+    if state is None or state[0] != fingerprint:
         return False
-    _append_event(conn, task_id, "integration_acceptance", receipt, run_id=snapshot[0])
+    _append_event(conn, task_id, "integration_acceptance", receipt, run_id=fingerprint[0])
     if not receipt["ok"]:
         conn.execute(
             "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
@@ -204,48 +222,63 @@ def record_integration_gate(conn, task_id: str, prepared) -> bool:
     return bool(receipt["ok"])
 
 
-def _snapshot(conn, task_id: str):
-    """The gate's run/status, its declaration, and the parent facts the receipt
-    was computed from — the tuple rechecked under the terminal write's lock."""
+def _gate_state(conn, task_id: str):
+    """``(fingerprint, evidence, config)`` for the gate, or ``None`` when the
+    card or its declaration is gone.
+
+    The fingerprint covers EVERY fact the verification is allowed to approve
+    from, not just the gate's own run/status pair — because almost all of that
+    evidence stays mutable while the network and git work runs with no
+    transaction open. A completed QA run's summary and metadata are editable
+    after the fact (``edit_task(result=…)``, which changes neither the
+    run id nor any status), the implementation's pinned
+    ``completion_contract`` and its accepted ``pr_acceptance`` receipt are rows
+    like any other, and the declaration itself can be re-configured. Comparing
+    only the ids would let ``complete_task`` promote a gate's child on evidence
+    that no longer exists; comparing this tuple refuses instead.
+    """
     row = conn.execute(
         "SELECT current_run_id, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
     config = get_gate(conn, task_id)
     if row is None or config is None:
         return None
+    evidence = _board_evidence(conn, config)
     parents = tuple(
         (conn.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (parent_id,))
          .fetchone() or {"status": None, "current_run_id": None})
         for parent_id in (config.implementation_task_id, config.qa_task_id)
     )
-    return (
+    fingerprint = (
         row["current_run_id"], row["status"], astuple(config),
         tuple((p["status"], p["current_run_id"]) for p in parents),
-        _latest_completed_qa_run_id(conn, config.qa_task_id),
+        evidence["evidence_digest"],
     )
-
-
-def _latest_completed_qa_run_id(conn, qa_task_id: str) -> Optional[int]:
-    row = conn.execute(
-        "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
-        "ORDER BY id DESC LIMIT 1", (qa_task_id,),
-    ).fetchone()
-    return int(row["id"]) if row is not None else None
+    return fingerprint, evidence, config
 
 
 def _board_evidence(conn, config: GateConfig) -> dict:
-    """Everything the verification needs from the board, read in one pass."""
+    """Everything the verification needs from the board, read in one pass.
+
+    ``evidence_digest`` fingerprints the RAW rows each condition is decided
+    from rather than the derived fields above them, so a rewrite that leaves
+    every id and status alone still invalidates the snapshot. It is a digest
+    rather than the values themselves because the summary, metadata and
+    acceptance payload it covers are free text the snapshot has no reason to
+    hold, log or compare in the clear.
+    """
     # ``assignee`` rides along because the gate's GitHub read runs as THAT
     # profile's ``gh`` login — this is the implementation card's PR (#122689).
     impl = conn.execute(
-        "SELECT status, assignee, completion_contract FROM tasks WHERE id = ?",
+        "SELECT status, assignee, current_run_id, completion_contract FROM tasks WHERE id = ?",
         (config.implementation_task_id,)).fetchone()
     qa = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (config.qa_task_id,)).fetchone()
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (config.qa_task_id,)).fetchone()
     qa_run = conn.execute(
         "SELECT id, summary, metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
         "ORDER BY id DESC LIMIT 1", (config.qa_task_id,)).fetchone()
     qa_metadata = _json_dict(qa_run["metadata"]) if qa_run is not None else {}
-    accepted = _accepted_acceptance_receipt(conn, config.implementation_task_id)
+    accepted_event_id, accepted_payload, accepted = _accepted_acceptance_receipt(
+        conn, config.implementation_task_id)
     return {
         "implementation_status": impl["status"] if impl is not None else None,
         "implementation_assignee": impl["assignee"] if impl is not None else None,
@@ -256,25 +289,49 @@ def _board_evidence(conn, config: GateConfig) -> dict:
         "qa_revision": _str_or_none(qa_metadata.get("revision")),
         "qa_summary_mentions_pass": "pass" in str(
             (qa_run["summary"] if qa_run is not None else "") or "").lower(),
-        "accepted_head_sha": accepted.get("head_sha"),
-        "pr_url": accepted.get("pr_url"),
+        # Coerced because the receipt is JSON read back off the event log: a
+        # non-string here would otherwise raise inside the regex checks and
+        # abort the completion instead of blocking the gate.
+        "accepted_head_sha": _str_or_none(accepted.get("head_sha")),
+        "pr_url": _str_or_none(accepted.get("pr_url")),
+        "evidence_digest": _digest([
+            astuple(config),
+            None if impl is None else [impl["status"], impl["current_run_id"],
+                                      impl["completion_contract"]],
+            None if qa is None else [qa["status"], qa["current_run_id"]],
+            None if qa_run is None else [qa_run["id"], qa_run["summary"], qa_run["metadata"]],
+            [accepted_event_id, accepted_payload],
+        ]),
     }
 
 
-def _accepted_acceptance_receipt(conn, implementation_task_id: str) -> dict:
-    """The newest ACCEPTED ``pr_acceptance`` receipt on the implementation card.
+def _digest(parts) -> str:
+    """Stable digest of the evidence rows. ``default=str`` keeps a surprising
+    column type (a BLOB summary, a float id) from raising here — the snapshot's
+    job is to notice change, and an undigestible row must not abort a
+    completion the gate would otherwise refuse with a receipt."""
+    return hashlib.sha256(
+        json.dumps(parts, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _accepted_acceptance_receipt(conn, implementation_task_id: str):
+    """``(event_id, raw_payload, payload)`` of the newest ACCEPTED
+    ``pr_acceptance`` receipt on the implementation card, else
+    ``(None, None, {})``.
 
     That receipt is the only durable record of which exact head GitHub
-    acceptance actually passed, which is the head QA's revision must match.
+    acceptance actually passed, which is the head QA's revision must match — so
+    both WHICH event it is and what it says belong in the snapshot.
     """
     for row in conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'pr_acceptance' "
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'pr_acceptance' "
         "ORDER BY id DESC", (implementation_task_id,),
     ):
         payload = _json_dict(row["payload"])
         if payload.get("ok"):
-            return payload
-    return {}
+            return int(row["id"]), row["payload"], payload
+    return None, None, {}
 
 
 def _json_dict(raw) -> dict:

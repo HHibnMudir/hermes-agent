@@ -106,17 +106,25 @@ zero outside a kanban task (footprint ladder rung 3).
   exact-head green checks (`kanban_pr_acceptance*`); an `integration_gates` row
   (`kanban_integration_gate*`) also demands a human merge into the configured branch, proving
   `merge_commit_sha` — NOT the head, which a squash merge discards — an ancestor of the freshly
-  fetched remote branch. Each guards a real failure:
+  fetched remote branch. **The human merger is mandatory and unconfigurable**: no flag, no config
+  key, and the legacy `require_human_merge` column is never read (a stored `0` is still gated on a
+  human) — a bot merging its own unreviewed work is the failure the gate is for, so never add a
+  bypass. Each guards a real failure:
   **Repository Rules is optional evidence** (403 on a private repo without a paid plan; reading it
   before Check Runs aborted collection, so the receipt claimed `checks: []` as if CI were silent) —
   required checks union branch protection + Rules + `kanban.completion_checks`, and
   "all observed checks green" is never a substitute for a *declared* policy. The PR pins once from
   `metadata.published_pr` at `request_review` and is then immutable; a near-miss key (`pr_url`, …)
-  raises rather than being guessed at, so a retry cannot swap in a green sibling. Network/git work
-  stays OUTSIDE the write txn with the board snapshot rechecked inside it; refusals persist a
+  raises rather than being guessed at, so a retry cannot swap in a green sibling. That pin lands
+  only AFTER the transition's own CAS wins — a normal `return` out of `write_txn` commits, so
+  binding earlier let a refused handoff pin a card's PR forever on a run it never owned. Network/git
+  work stays OUTSIDE the write txn, and the snapshot rechecked inside it covers EVERY fact the
+  verification approved from, not just ids: statuses/run ids, the declaration, the implementation's
+  contract, the accepted `pr_acceptance` event, and the completed QA run's own summary/metadata
+  (which `edit_task(result=…)` rewrites without touching a single id). Refusals persist a
   secret-free immutable receipt (never gh/git stderr); "the API could not answer" stays distinct
-  from "not merged yet" (`UNPROVABLE_PHASES`). Empty `integration_gates` is inert — legacy links
-  keep plain done-parent semantics.
+  from "not merged yet" (`UNPROVABLE_PHASES`), and a missing/hung `git` is unprovable rather than a
+  raise. Empty `integration_gates` is inert — legacy links keep plain done-parent semantics.
 - **Toolset:** `tools/kanban_tools.py` — `kanban_show, kanban_complete, kanban_request_review,
   kanban_request_changes, kanban_block, kanban_schedule, kanban_heartbeat, kanban_comment,
   kanban_create, kanban_link,

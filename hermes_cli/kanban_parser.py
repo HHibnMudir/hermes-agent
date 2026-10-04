@@ -158,8 +158,9 @@ _INTEGRATION_GATE_SPECS = [
              help="Remote fetched before proving the merge (default: origin)"),
         _arg("--branch", default="develop",
              help="Integration branch the PR must be merged into (default: develop)"),
-        _arg("--allow-bot-merge", action="store_true",
-             help="Accept a GitHub Bot as the merger (default: the merge must be a human's)"),
+        # No bot-merge opt-out exists: a human merger is mandatory for every
+        # gate, because a bot merging its own unreviewed work is the failure the
+        # gate is for.
         _json_flag(),
     ], help="Declare (or re-declare) the integration gate on a card"),
     _cmd("show", [_arg("gate_task_id"), _json_flag()],
@@ -301,7 +302,8 @@ _SPECS = [
          description=(
              "An integration gate is an opt-in card that cannot complete until the "
              "implementation its QA passed is actually integrated: the exact implementation PR "
-             "is merged (by a human, by default) into the configured integration branch, and "
+             "is merged BY A HUMAN (always — there is no bot-merge opt-out) into the configured "
+             "integration branch, and "
              "that merge commit is an ancestor of the freshly fetched remote branch. Squash "
              "merges are handled by proving the PR's merge_commit_sha, not its head. Any "
              "condition that cannot be proven blocks the gate, so the downstream card is never "
