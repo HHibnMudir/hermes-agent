@@ -2692,6 +2692,7 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    completion_attempt_id: Optional[str] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2710,27 +2711,33 @@ def complete_task(
     outside the write txn and rechecking its snapshot inside it: a GitHub
     completion contract (``pr_acceptance``) and a declared integration gate
     (``integration_acceptance``). Both persist a receipt on refusal and leave
-    the card in place, so a refused gate never promotes a child.
+    the card in place, so a refused gate never promotes a child. Each receipt
+    is stamped with this attempt's ``completion_attempt_id`` — passed in by a
+    caller that means to read its own refusal back (the CLI), otherwise minted
+    here, so every attempt is identifiable either way.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    from hermes_cli.kanban_completion_attempt import new_completion_attempt_id
     from hermes_cli.kanban_integration_gate_store import (
         prepare_integration_gate, record_integration_gate,
     )
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
+    attempt_id = completion_attempt_id or new_completion_attempt_id()
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
-    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
+    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata,
+                                    attempt_id=attempt_id)
     if acceptance is False:
         return False
     # Declared integration gates verify GitHub + git OUTSIDE the write txn; a
     # card with no declaration is unaffected (None).
-    gate = prepare_integration_gate(conn, task_id, expected_run_id)
+    gate = prepare_integration_gate(conn, task_id, expected_run_id, attempt_id=attempt_id)
     if gate is False:
         return False
     with write_txn(conn):

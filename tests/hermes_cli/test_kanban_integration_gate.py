@@ -58,6 +58,9 @@ class FakeGitHub:
         self.check_runs = []
         self.rules_forbidden = True
         self.pull_read_fails = False
+        #: Stands in for the ``/pulls/{n}`` record verbatim, so a test can hand
+        #: the gate a shape GitHub would never send.
+        self.pull_override = None
         self.calls = []
         self.hooks = {}
 
@@ -99,7 +102,7 @@ class FakeGitHub:
         elif "/pulls/" in endpoint:
             if self.pull_read_fails:
                 raise subprocess.CalledProcessError(1, ["gh", "api", endpoint])
-            value = {
+            value = self.pull_override if self.pull_override is not None else {
                 "head": {"sha": self.head}, "base": {"ref": self.base},
                 "state": "open" if self.state == "OPEN" else "closed",
                 "merged": self.merged, "merge_commit_sha": self.merge_commit_sha,
@@ -914,6 +917,177 @@ def test_mutating_the_evidence_during_verification_refuses_the_completion(github
         assert receipts == []
 
 
+@pytest.mark.parametrize("removed,completes", [
+    ("implementation", False), ("qa", False), ("both", False), (None, True),
+])
+def test_unlinking_a_declared_parent_during_verification_refuses_the_gate(
+        github, clone, removed, completes):
+    """A declaration names two PARENTS, and an edge is an ordinary row.
+
+    Unlinking one while the gate reads GitHub is the one change that makes the
+    board's own dependency check EASIER to satisfy — with both edges gone it is
+    vacuously true — so nothing downstream would catch it. The snapshot covers
+    the exact edges, and the terminal write asks for them again by name.
+    """
+    with connect_closing() as conn:
+        impl, qa, gate_id, child = _graph(conn, github, clone)
+        merge_sha = clone.commit("squash merge of #7")
+        github.merge(merge_sha)
+
+        def interfere():
+            with connect_closing() as rival:
+                if removed in ("implementation", "both"):
+                    assert kb.unlink_tasks(rival, impl, gate_id) is True
+                if removed in ("qa", "both"):
+                    assert kb.unlink_tasks(rival, qa, gate_id) is True
+
+        # Fires while the gate is reading GitHub, i.e. after prepare_* snapshotted.
+        github.hooks["/pulls/"] = interfere
+        assert kb.complete_task(conn, gate_id) is completes
+
+        assert (kb.get_task(conn, gate_id).status == "done") is completes
+        assert (kb.get_task(conn, child).status == "ready") is completes
+        receipt = _receipt(conn, gate_id)
+    # A rejected snapshot writes no receipt: the evidence it would describe was
+    # never valid for the graph as it now stands.
+    assert (receipt is not None and receipt["ok"]) is completes
+
+
+def test_a_configured_gate_with_no_parent_edges_is_never_satisfied(github, clone):
+    """The same hole, already open before the attempt starts: a declaration
+    whose edges were unlinked earlier must refuse with its own condition, not
+    sail through a dependency check that has no parents left to wait for."""
+    with connect_closing() as conn:
+        impl, qa, gate_id, child = _graph(conn, github, clone)
+        github.merge(clone.commit("squash merge of #7"))
+        assert kb.unlink_tasks(conn, impl, gate_id) is True
+        assert kb.unlink_tasks(conn, qa, gate_id) is True
+        # Nothing else refuses this card: with no parents the board's gating is
+        # vacuously satisfied.
+        assert kb._parents_satisfied(conn, gate_id) is True
+
+        calls_before = len(github.calls)
+        assert kb.complete_task(conn, gate_id) is False
+        assert kb.get_task(conn, gate_id).status != "done"
+        assert kb.get_task(conn, child).status == "todo"
+        receipt = _receipt(conn, gate_id)
+    assert receipt["phase"] == "declared_parents_linked"
+    assert not _condition(receipt, "declared_parents_linked")["ok"]
+    assert impl in receipt["detail"] and qa in receipt["detail"]
+    assert "hermes kanban link" in receipt["recovery"]
+    # A gate the board itself cannot support asks GitHub nothing.
+    assert github.calls[calls_before:] == []
+
+
+def test_the_ancestry_is_proven_against_the_captured_tip_not_the_mutable_ref(
+        github, clone, monkeypatch):
+    """``refs/remotes/origin/<branch>`` is mutable.
+
+    Between resolving it and asking git whether the merge is in it, another
+    process in the same clone can move it — so the gate resolves the tip ONCE,
+    to an exact commit, and both the ancestry question and the receipt name
+    that captured commit. Here the ref is moved to a descendant of the merge
+    commit, which is the answer a question asked about the REF would have
+    believed.
+    """
+    from hermes_cli import kanban_integration_gate as gate
+
+    with connect_closing() as conn:
+        impl, qa, gate_id, child = _graph(conn, github, clone)
+        captured = clone.commit("the develop tip the gate captures")
+        merge_sha = clone.commit("merge that never reached develop", push_to=None)
+        descendant = clone.commit("a commit on top of that merge", push_to=None)
+        github.merge(merge_sha)
+
+        real_git = gate._git
+
+        def moving_git(repository_path, *args):
+            result = real_git(repository_path, *args)
+            if args[0] == "rev-parse":
+                real_git(repository_path, "update-ref",
+                         "refs/remotes/origin/develop", descendant)
+            return result
+
+        monkeypatch.setattr(gate, "_git", moving_git)
+        assert kb.complete_task(conn, gate_id) is False
+        assert kb.get_task(conn, gate_id).status != "done"
+        assert kb.get_task(conn, child).status == "todo"
+        receipt = _receipt(conn, gate_id)
+    assert receipt["phase"] == "merge_commit_in_integration_branch"
+    # Proof, result and receipt all name the captured tip, never the moved ref.
+    assert receipt["fetched_branch_tip"] == captured
+    detail = _condition(receipt, "merge_commit_in_integration_branch")["detail"]
+    assert merge_sha in detail and captured in detail and descendant not in detail
+
+
+@pytest.mark.parametrize("record", [
+    "merged", ["merged"], 7,
+    {"base": {"ref": "develop"}, "state": "closed", "merged": True},
+    {"head": None, "base": {"ref": "develop"}, "state": "closed", "merged": True},
+    {"head": {"sha": 42}, "base": {"ref": "develop"}, "state": "closed", "merged": True},
+    {"head": {"sha": HEAD}, "base": "develop", "state": "closed", "merged": True},
+    {"head": {"sha": HEAD}, "base": ["develop"], "state": "closed", "merged": True},
+    {"head": {"sha": HEAD}, "base": {"ref": "  "}, "state": "closed", "merged": True},
+    {"head": {"sha": HEAD}, "base": {"ref": "develop"}, "state": "closed", "merged": "true"},
+    {"head": {"sha": HEAD}, "base": {"ref": "develop"}, "state": "closed", "merged": "false"},
+    {"head": {"sha": HEAD}, "base": {"ref": "develop"}, "state": None, "merged": True},
+    {"head": {"sha": HEAD}, "base": {"ref": "develop"}, "state": "closed", "merged": True,
+     "merged_at": 1759312800},
+])
+def test_malformed_pr_evidence_blocks_the_gate_as_unprovable(github, clone, record):
+    """Every field below the shape check is dereferenced, and ``merged:
+    "false"`` is a TRUTHY string. An answer that is not a pull request can
+    neither prove nor disprove the merge, so it blocks as unprovable — with a
+    receipt naming the field, never a traceback out of the completion."""
+    with connect_closing() as conn:
+        impl = _accepted_implementation(conn, github)
+        qa = _passing_qa(conn, impl)
+        gate_id = _gate(conn, clone, impl, qa)
+        child = kb.create_task(conn, title="Downstream implementation")
+        kb.link_tasks(conn, gate_id, child)
+        github.merge(clone.commit("squash merge of #7"))
+        github.pull_override = record
+
+        assert kb.complete_task(conn, gate_id) is False
+        assert kb.get_task(conn, gate_id).status != "done"
+        assert kb.get_task(conn, child).status == "todo"
+        receipt = _receipt(conn, gate_id)
+    assert receipt["phase"] == "pr_evidence_malformed"
+    assert receipt["phase"] in UNPROVABLE_PHASES
+    assert not _condition(receipt, "pr_evidence_well_formed")["ok"]
+    # Nothing was read off the malformed record, and nothing of it is persisted.
+    assert receipt["merge_commit_sha"] is None and receipt["merged_by"] is None
+    assert receipt["pr_head_sha"] is None
+    assert "gh/API access" in receipt["recovery"]
+
+
+def test_a_pr_whose_head_moved_after_acceptance_and_was_then_merged_fails(github, clone):
+    """The gate proves the integration of the head acceptance passed and QA
+    reviewed. A PR that took another push afterwards and was then merged
+    integrated something nobody judged — and its squash merge commit looks
+    exactly like the one the accepted head would have produced, so the merge
+    evidence alone can never tell them apart."""
+    with connect_closing() as conn:
+        impl = _accepted_implementation(conn, github)
+        qa = _passing_qa(conn, impl)
+        gate_id = _gate(conn, clone, impl, qa)
+        child = kb.create_task(conn, title="Downstream implementation")
+        kb.link_tasks(conn, gate_id, child)
+
+        # A new push lands on the PR after acceptance and QA, and THAT is merged.
+        github.head = OTHER_HEAD
+        github.merge(clone.commit("squash merge of the new head"))
+
+        assert kb.complete_task(conn, gate_id) is False
+        assert kb.get_task(conn, gate_id).status != "done"
+        assert kb.get_task(conn, child).status == "todo"
+        receipt = _receipt(conn, gate_id)
+    assert receipt["phase"] == "pr_head_matches_accepted_head"
+    assert receipt["pr_head_sha"] == OTHER_HEAD
+    assert receipt["accepted_head_sha"] == HEAD == receipt["qa_revision"]
+    assert "Re-run the implementation's acceptance" in receipt["recovery"]
+
+
 def test_the_gate_holds_no_write_lock_while_it_reads_github_and_git(github, clone):
     """A concurrent writer must be able to commit mid-verification; if the gate
     held the board's write lock this would raise "database is locked"."""
@@ -1048,6 +1222,72 @@ def test_a_refusal_with_no_receipt_keeps_the_generic_message(github, clone):
     already_done = kc.run_slash(f"complete {gate_id}")
     assert "unknown id or terminal state" in already_done
     assert "refused" not in already_done
+
+
+def test_a_concurrent_attempts_receipt_is_never_reported_as_this_ones_reason(github, clone):
+    """Two connections complete the same gate, interleaved.
+
+    The gates verify GitHub/git with no transaction open, so a receipt another
+    attempt writes meanwhile lands above this attempt's event floor too. A
+    floor-only lookup therefore explained THIS refusal — an unsatisfied parent,
+    which no gate wrote a receipt for — with the rival's receipt. Only an exact
+    attempt-id match may be reported.
+    """
+    from hermes_cli import kanban as kc
+    from hermes_cli.kanban_completion_attempt import new_completion_attempt_id
+
+    with connect_closing() as conn:
+        impl, qa, gate_id, child = _graph(conn, github, clone)
+        floor = kc._latest_event_id(conn, gate_id)
+        attempt = new_completion_attempt_id()
+
+        def rival_attempt_then_block_the_parents():
+            github.hooks.clear()  # the rival must not re-enter this hook
+            with connect_closing() as rival:
+                # The rival's own attempt refuses and leaves ITS receipt behind,
+                # above this attempt's floor.
+                assert kb.complete_task(rival, gate_id) is False
+                assert _receipt(rival, gate_id) is not None
+                # And now this attempt's in-transaction parent check will refuse
+                # it for a reason no gate ever writes a receipt for.
+                blocker = kb.create_task(rival, title="a dependency added mid-attempt")
+                kb.link_tasks(rival, blocker, gate_id)
+
+        github.hooks["/pulls/"] = rival_attempt_then_block_the_parents
+        assert kb.complete_task(conn, gate_id, completion_attempt_id=attempt) is False
+        assert kb.get_task(conn, gate_id).status != "done"
+        assert kb.get_task(conn, child).status == "todo"
+
+        # This attempt wrote no receipt, so it has nothing of its own to report…
+        assert kc._completion_refusal(conn, gate_id, floor, attempt) is None
+        # …even though the rival's receipt does sit above its floor.
+        rival_receipt = _receipt(conn, gate_id)
+        assert rival_receipt["completion_attempt_id"] not in (None, attempt)
+
+    # The operator gets the generic message, not the rival's condition.
+    assert "unknown id or terminal state" in kc.run_slash(f"complete {gate_id}")
+
+
+def test_two_refusals_on_one_card_each_report_their_own_receipt(github, clone):
+    """The ordinary case the same stamp has to get right: two attempts, two
+    different unproven conditions, each read back from the same event floor."""
+    from hermes_cli import kanban as kc
+    from hermes_cli.kanban_completion_attempt import new_completion_attempt_id
+
+    with connect_closing() as conn:
+        _, _, gate_id, _ = _graph(conn, github, clone)
+        floor = kc._latest_event_id(conn, gate_id)
+
+        waiting = new_completion_attempt_id()
+        assert kb.complete_task(conn, gate_id, completion_attempt_id=waiting) is False
+        github.pull_read_fails = True
+        unprovable = new_completion_attempt_id()
+        assert kb.complete_task(conn, gate_id, completion_attempt_id=unprovable) is False
+
+        # Same floor, two ids, two correct answers — the id is what separates them.
+        assert "waiting_for_merge" in kc._completion_refusal(conn, gate_id, floor, waiting)
+        assert "pr_unreadable" in kc._completion_refusal(conn, gate_id, floor, unprovable)
+        assert kc._completion_refusal(conn, gate_id, floor, new_completion_attempt_id()) is None
 
 
 def test_the_cli_declares_inspects_and_removes_a_gate(github, clone):

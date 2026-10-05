@@ -6,7 +6,8 @@ board fact the verification was computed from is fingerprinted first, the
 network and git work happens with no transaction open, and that fingerprint is
 re-read and compared inside ``complete_task``'s write transaction before the
 terminal UPDATE. Any change to the gate's run/status, the declaration, the
-parents, the implementation's contract, its accepted acceptance receipt, or the
+parents (their rows AND the two ``task_links`` edges that make them parents at
+all), the implementation's contract, its accepted acceptance receipt, or the
 completed QA run's own summary/metadata rejects the attempt rather than
 promoting the gate's child on evidence that has since moved.
 
@@ -22,6 +23,7 @@ from dataclasses import astuple
 from pathlib import Path
 from typing import Optional
 
+from hermes_cli.kanban_completion_attempt import stamp_attempt
 from hermes_cli.kanban_db_connect import write_txn
 from hermes_cli.kanban_integration_gate import GateConfig, collect_gate_acceptance
 
@@ -176,13 +178,15 @@ def _validated_repository_path(value) -> str:
 
 # --- terminal-transition gate ---
 
-def prepare_integration_gate(conn, task_id: str, expected_run_id: Optional[int]):
+def prepare_integration_gate(conn, task_id: str, expected_run_id: Optional[int], *,
+                             attempt_id: Optional[str] = None):
     """``None`` when the card is not a declared gate, ``False`` when the
     caller's run/status snapshot is already lost, else ``(fingerprint, receipt)``.
 
     The external verification runs here — deliberately BEFORE
     ``complete_task`` opens its write transaction, so no network or git call
-    ever holds the board's write lock.
+    ever holds the board's write lock. ``attempt_id`` identifies the completion
+    attempt the resulting receipt belongs to.
     """
     if get_gate(conn, task_id) is None:
         # No declaration: an ordinary card, which the feature must not touch.
@@ -195,16 +199,18 @@ def prepare_integration_gate(conn, task_id: str, expected_run_id: Optional[int])
     if status not in _COMPLETABLE or (expected_run_id is not None and run_id != expected_run_id):
         return False
     # The declaration verified against is the one the fingerprint covers.
-    return fingerprint, collect_gate_acceptance(config, evidence)
+    return fingerprint, stamp_attempt(collect_gate_acceptance(config, evidence), attempt_id)
 
 
 def record_integration_gate(conn, task_id: str, prepared) -> bool:
     """Called under ``complete_task``'s write_txn, before its terminal UPDATE.
 
     Re-reads every fact the receipt was approved from and refuses unless all of
-    them are byte-for-byte what the verification saw. Persists the immutable
-    receipt either way: a failed gate must leave diagnostics behind without
-    making the gate — or its child — executable.
+    them are byte-for-byte what the verification saw, then — on the success path
+    only — asks once more, by name, whether the gate's two declared parent edges
+    still exist. Persists the immutable receipt either way: a failed gate must
+    leave diagnostics behind without making the gate — or its child —
+    executable.
     """
     from hermes_cli.kanban_db import _append_event
 
@@ -219,7 +225,20 @@ def record_integration_gate(conn, task_id: str, prepared) -> bool:
             (f"Integration gate {receipt['phase']}: {receipt.get('detail', '')} "
              f"{receipt['recovery']}", task_id),
         )
-    return bool(receipt["ok"])
+        return False
+    # The two declared parent edges, asked for again and by name. The
+    # fingerprint already covers them, so this cannot normally differ — it is
+    # here because the one thing the terminal write must never do is promote a
+    # gate's child while the gate's own declared parents are not its parents,
+    # and that must not depend on reading a digest correctly.
+    if not all(_declared_parent_edges(conn, state[2]).values()):
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("Integration gate declared_parents_linked: the gate's declared implementation/QA "
+             "edges are gone from the board graph. " + _RELINK_HINT, task_id),
+        )
+        return False
+    return True
 
 
 def _gate_state(conn, task_id: str):
@@ -233,9 +252,17 @@ def _gate_state(conn, task_id: str):
     after the fact (``edit_completed_task_result``, which changes neither the
     run id nor any status), the implementation's pinned
     ``completion_contract`` and its accepted ``pr_acceptance`` receipt are rows
-    like any other, and the declaration itself can be re-configured. Comparing
-    only the ids would let ``complete_task`` promote a gate's child on evidence
-    that no longer exists; comparing this tuple refuses instead.
+    like any other, the two ``task_links`` edges that make implementation and
+    QA the gate's PARENTS can be unlinked, and the declaration itself can be
+    re-configured. Comparing only the ids would let ``complete_task`` promote a
+    gate's child on evidence that no longer exists; comparing this tuple
+    refuses instead.
+
+    The parent edges are in the tuple explicitly rather than only inside the
+    digest: losing one is the one change that makes the board's own dependency
+    check *easier* to satisfy (fewer parents to be done, and with both gone it
+    is vacuously true), so it is the last thing that may be covered by
+    implication.
     """
     row = conn.execute(
         "SELECT current_run_id, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -251,6 +278,7 @@ def _gate_state(conn, task_id: str):
     fingerprint = (
         row["current_run_id"], row["status"], astuple(config),
         tuple((p["status"], p["current_run_id"]) for p in parents),
+        (evidence["implementation_linked"], evidence["qa_linked"]),
         evidence["evidence_digest"],
     )
     return fingerprint, evidence, config
@@ -277,7 +305,10 @@ def _board_evidence(conn, config: GateConfig) -> dict:
     qa_metadata = _json_dict(qa_run["metadata"]) if qa_run is not None else {}
     accepted_event_id, accepted_payload, accepted = _accepted_acceptance_receipt(
         conn, config.implementation_task_id)
+    edges = _declared_parent_edges(conn, config)
     return {
+        "implementation_linked": edges[config.implementation_task_id],
+        "qa_linked": edges[config.qa_task_id],
         "implementation_status": impl["status"] if impl is not None else None,
         "contract": impl["completion_contract"] if impl is not None else None,
         "qa_status": qa["status"] if qa is not None else None,
@@ -299,6 +330,22 @@ def _board_evidence(conn, config: GateConfig) -> dict:
             None if qa_run is None else [qa_run["id"], qa_run["summary"], qa_run["metadata"]],
             [accepted_event_id, accepted_payload],
         ]),
+    }
+
+
+#: Shown on a refusal that only an operator's `link` can fix.
+_RELINK_HINT = ("Restore the edge with `hermes kanban link <parent> <gate>`, or remove the "
+                "declaration with `hermes kanban integration-gate rm <gate>`.")
+
+
+def _declared_parent_edges(conn, config: GateConfig) -> dict:
+    """``{task_id: is still a direct parent of the gate}`` for both declarations."""
+    return {
+        parent_id: conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent_id, config.gate_task_id),
+        ).fetchone() is not None
+        for parent_id in (config.implementation_task_id, config.qa_task_id)
     }
 
 

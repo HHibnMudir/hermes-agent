@@ -52,6 +52,9 @@ class FakeGitHub:
         self.statuses = []
         self.noise_runs = 0
         self.total_count_override = None
+        #: Stands in for the ``/pulls/{n}`` record verbatim, so a test can hand
+        #: the collector a shape GitHub would never send.
+        self.pull_override = None
         self.calls = []
         self.hooks = {}
 
@@ -99,9 +102,10 @@ class FakeGitHub:
         elif "/statuses" in endpoint:
             value = [self.statuses] if self.statuses else [[]]
         elif "/pulls/" in endpoint:
-            value = {"head": {"sha": self.head}, "base": {"ref": self.base},
-                     "state": "closed" if self.state != "OPEN" else "open",
-                     "merged": self.merged}
+            value = self.pull_override if self.pull_override is not None else {
+                "head": {"sha": self.head}, "base": {"ref": self.base},
+                "state": "closed" if self.state != "OPEN" else "open",
+                "merged": self.merged}
         else:
             raise AssertionError(f"unexpected endpoint {endpoint}")
         if hook is not None:
@@ -481,6 +485,130 @@ def test_declared_checks_load_from_config_yaml_and_bad_entries_report_themselves
         receipt = _receipt(conn, tid)
     assert receipt["phase"] == "declared_policy"
     assert "required_checks" in receipt["config_problem"]
+
+
+def _rerun_after_the_first_collection(github, conclusion, *, status="completed", run_id=43):
+    """Queue one more run of the required check against the SAME head, once,
+    after the first collection pass has read the check-run pages.
+
+    The stale recheck is the first thing that happens after that pass, so its
+    ``/pulls/`` call is the exact moment a rerun becomes invisible to evidence
+    already collected — and the PR itself never moves, which is all that
+    recheck can see.
+    """
+    fired = []
+
+    def rerun():
+        if fired:
+            return
+        fired.append(True)
+        github.run("ci/test", conclusion, status=status, run_id=run_id)
+
+    github.hooks["/pulls/"] = rerun
+
+
+@pytest.mark.parametrize("conclusion,status", [
+    (None, "queued"), (None, "in_progress"), ("failure", "completed"),
+    ("cancelled", "completed"), ("timed_out", "completed"), ("skipped", "completed"),
+    ("neutral", "completed"), ("action_required", "completed"),
+    ("some_future_conclusion", "completed"),
+])
+def test_a_rerun_on_the_same_head_after_collection_fails_closed(github, conclusion, status):
+    """The window an exact-head recheck cannot see.
+
+    A rerun queues a NEW required run against the SAME sha: the PR's head,
+    base and state are untouched, so collecting once and then only rechecking
+    the PR records an acceptance that was already out of date. Every
+    non-success family a newer run can be in has to refuse.
+    """
+    _declare_checks({"acme/repo": {"required_checks": ["ci/test"]}})
+    github.rules_forbidden = True
+    github.run("ci/test", "success")
+    _rerun_after_the_first_collection(github, conclusion, status=status)
+    with connect_closing() as conn:
+        tid = _card(conn)
+        assert kb.complete_task(conn, tid, metadata={"published_pr": PR_URL}) is False
+        assert kb.get_task(conn, tid).status != "done"
+        receipt = _receipt(conn, tid)
+    assert receipt["ok"] is False and receipt["classification"] != "success"
+    assert receipt["phase"] == "recheck_evaluate"
+    # The first pass is kept as history; the recorded evidence is the re-read
+    # one, which is the only one that saw the newer run.
+    assert [c["classification"] for c in receipt["recheck"]["first_pass"]] == ["success"]
+    assert {c["id"] for c in receipt["checks"]} == {42, 43}
+
+
+def test_a_rerun_that_also_succeeded_still_accepts(github):
+    """The recheck is a fail-closed re-read, not a new way to refuse: a rerun
+    that went green on the same head is still green."""
+    _declare_checks({"acme/repo": {"required_checks": ["ci/test"]}})
+    github.rules_forbidden = True
+    github.run("ci/test", "success")
+    _rerun_after_the_first_collection(github, "success", run_id=44)
+    with connect_closing() as conn:
+        tid = _card(conn)
+        assert kb.complete_task(conn, tid, metadata={"published_pr": PR_URL}) is True
+        receipt = _receipt(conn, tid)
+    assert receipt["ok"] and receipt["phase"] == "accepted"
+    assert receipt["recheck"]["performed"] is True
+    assert [c["classification"] for c in receipt["checks"]] == ["success", "success"]
+
+
+def test_the_evidence_is_collected_exactly_twice_and_never_in_a_loop(github):
+    """Fail-closed must not become a retry loop: however the card ends, the
+    checks are collected at most twice and the PR rechecked at most twice."""
+    _declare_checks({"acme/repo": {"required_checks": ["ci/test"]}})
+    github.rules_forbidden = True
+    github.run("ci/test", "success")
+    with connect_closing() as conn:
+        accepted = _card(conn)
+        assert kb.complete_task(conn, accepted, metadata={"published_pr": PR_URL}) is True
+    assert len([c for c in github.calls if "/check-runs" in c]) == 2
+    assert len([c for c in github.calls if "/statuses" in c]) == 2
+    assert len([c for c in github.calls if "/pulls/" in c]) == 2
+
+    # A card refused on the first pass never pays for the second one.
+    github.calls.clear()
+    github.check_runs = []
+    github.run("ci/test", "failure")
+    with connect_closing() as conn:
+        refused = _card(conn, title="red")
+        assert kb.complete_task(conn, refused, metadata={"published_pr": PR_URL}) is False
+        assert _receipt(conn, refused)["recheck"]["performed"] is False
+    assert len([c for c in github.calls if "/check-runs" in c]) == 1
+    assert len([c for c in github.calls if "/pulls/" in c]) == 1
+
+
+@pytest.mark.parametrize("record", [
+    "merged", ["merged"], 7,
+    {"base": {"ref": "main"}, "state": "open", "merged": False},
+    {"head": None, "base": {"ref": "main"}, "state": "open", "merged": False},
+    {"head": {"sha": 42}, "base": {"ref": "main"}, "state": "open", "merged": False},
+    {"head": {"sha": HEAD}, "base": "main", "state": "open", "merged": False},
+    {"head": {"sha": HEAD}, "base": ["main"], "state": "open", "merged": False},
+    {"head": {"sha": HEAD}, "base": {"ref": "  "}, "state": "open", "merged": False},
+    {"head": {"sha": HEAD}, "base": {"ref": "main"}, "state": "open", "merged": "true"},
+    {"head": {"sha": HEAD}, "base": {"ref": "main"}, "state": "open", "merged": "false"},
+    {"head": {"sha": HEAD}, "base": {"ref": "main"}, "state": 7, "merged": False},
+])
+def test_a_malformed_pr_record_blocks_acceptance_without_raising(github, record):
+    """The head recheck dereferences this record field by field, and
+    ``merged: "false"`` is a truthy string. A shape that cannot be read is
+    infrastructure trouble, never an acceptance and never a traceback."""
+    _declare_checks({"acme/repo": {"required_checks": ["ci/test"]}})
+    github.rules_forbidden = True
+    github.run("ci/test", "success")
+    github.pull_override = record
+    with connect_closing() as conn:
+        tid = _card(conn)
+        assert kb.complete_task(conn, tid, metadata={"published_pr": PR_URL}) is False
+        assert kb.get_task(conn, tid).status != "done"
+        receipt = _receipt(conn, tid)
+    assert receipt["ok"] is False and receipt["classification"] == "infra"
+    assert receipt["phase"] == "stale_recheck"
+    # The receipt names which field could not be read, never the body itself.
+    assert "malformed" in receipt["detail"]
+    assert "pull request" in receipt["detail"]
 
 
 def test_local_only_cards_never_reach_github(github):

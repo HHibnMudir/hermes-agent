@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from hermes_cli.kanban_completion_attempt import stamp_attempt
 from hermes_cli.kanban_db_connect import write_txn
 from hermes_cli.kanban_pr_acceptance import _PR, collect_acceptance
 
@@ -106,7 +107,13 @@ def bind_published_pr(conn, task_id: str, metadata: Any, *, run_id: Optional[int
     return published
 
 
-def prepare_acceptance(conn, task_id, expected_run_id, metadata):
+def prepare_acceptance(conn, task_id, expected_run_id, metadata, *, attempt_id=None):
+    """Collect acceptance evidence for ONE completion attempt.
+
+    ``attempt_id`` is stamped onto the receipt so the attempt that persisted it
+    can be identified later (``kanban_completion_attempt``); the network work
+    itself happens with no transaction open.
+    """
     snapshot = _snapshot(conn, task_id)
     if snapshot is None:
         return False
@@ -129,7 +136,7 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
             conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (published_pr, task_id))
         snapshot = (run_id, status, published_pr)
         contract = published_pr
-    return snapshot, collect_acceptance(contract, published_pr)
+    return snapshot, stamp_attempt(collect_acceptance(contract, published_pr), attempt_id)
 
 
 def record_acceptance(conn, task_id, acceptance):

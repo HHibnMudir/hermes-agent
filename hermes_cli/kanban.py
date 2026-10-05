@@ -28,6 +28,7 @@ from hermes_cli.kanban_output import (
     _task_to_dict,
 )
 from hermes_cli.kanban_boards import _dispatch_boards
+from hermes_cli.kanban_completion_attempt import new_completion_attempt_id, refusal_receipt
 from hermes_cli.kanban_integration_gate_cli import _dispatch_integration_gate
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
@@ -868,35 +869,36 @@ _COMPLETION_GATE_EVENTS = {
 
 
 def _latest_event_id(conn, task_id: str) -> int:
-    """Highest event id on the task right now — the floor that tells a receipt
-    written by THIS attempt apart from one left by an earlier one."""
+    """Highest event id on the task right now — a cheap floor bounding how far
+    back a refusal lookup has to scan."""
     row = conn.execute(
         "SELECT MAX(id) AS id FROM task_events WHERE task_id = ?", (task_id,)).fetchone()
     return int(row["id"] or 0) if row is not None else 0
 
 
-def _completion_refusal(conn, task_id: str, event_floor: int) -> Optional[str]:
+def _completion_refusal(conn, task_id: str, event_floor: int,
+                        attempt_id: str) -> Optional[str]:
     """Why ``complete_task`` actually refused, when it left a receipt behind.
 
     Both opt-in gates persist their receipt (and the card's
     ``last_failure_error``) in the very transaction that refuses the transition,
-    so a receipt above ``event_floor`` belongs to this attempt — a leftover from
-    a previous one must never be reported as this one's reason. Without such a
-    receipt the caller keeps the generic message: the refusal really was an
-    unknown id, a terminal/ineligible status, unsatisfied parents or a lost run
-    race, none of which a gate explains.
+    stamped with the attempt that wrote it — and only an exact
+    ``attempt_id`` match is reported here. The event floor alone was not enough:
+    the gates verify GitHub/git with no transaction open, so a receipt another
+    connection writes meanwhile also sits above this attempt's floor, and
+    reporting it blames this operator for a condition another attempt hit.
+
+    Without a receipt of its own the caller keeps the generic message: the
+    refusal really was an unknown id, a terminal/ineligible status, unsatisfied
+    parents or a lost run race, none of which a gate explains.
     """
-    row = conn.execute(
-        "SELECT kind, payload FROM task_events WHERE task_id = ? AND id > ? "
-        f"AND kind IN ({', '.join('?' * len(_COMPLETION_GATE_EVENTS))}) ORDER BY id DESC LIMIT 1",
-        (task_id, event_floor, *_COMPLETION_GATE_EVENTS),
-    ).fetchone()
-    if row is None:
+    found = refusal_receipt(conn, task_id, attempt_id, event_floor)
+    if found is None:
         return None
-    receipt = kb._json_dict(row["payload"])
+    kind, receipt = found
     if receipt.get("ok"):
         return None
-    label = _COMPLETION_GATE_EVENTS[row["kind"]]
+    label = _COMPLETION_GATE_EVENTS[kind]
     phase = str(receipt.get("phase") or "").strip()
     verdict = str(receipt.get("classification") or "").strip()
     if verdict and verdict != phase:
@@ -943,14 +945,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
             event_floor = _latest_event_id(conn, tid)
+            # This attempt's own id: the gates stamp it onto whatever receipt
+            # they persist, so a concurrent attempt's receipt can never be read
+            # back as this one's reason.
+            attempt_id = new_completion_attempt_id()
             try:
                 ok = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                       expected_run_id=_worker_run_id_for(tid),
-                                      force=bool(getattr(args, "force", False)))
+                                      force=bool(getattr(args, "force", False)),
+                                      completion_attempt_id=attempt_id)
                 if not ok:
                     # A completion gate that refused left the real reason behind;
                     # "unknown id or terminal state" is for when nothing did.
-                    fail_msg[tid] = _completion_refusal(conn, tid, event_floor) or fail_msg[tid]
+                    fail_msg[tid] = (_completion_refusal(conn, tid, event_floor, attempt_id)
+                                     or fail_msg[tid])
                 return ok
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
