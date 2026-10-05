@@ -16,6 +16,15 @@ aborted collection on that 403 — the receipt then said ``checks: []`` as if CI
 had reported nothing. Rules unavailability is now recorded and collection
 continues against the declared policy (``kanban.completion_checks``); every
 other endpoint this gate needs stays mandatory and fails closed.
+
+Collection happens TWICE for a card that would otherwise be accepted. A rerun
+queues a new run against the SAME head commit, so a single pass could read
+"green" and then be recorded as acceptance while a fresh required run was
+already queued on that exact sha — the PR head never moved, which is all the
+stale recheck could see. The second pass is bounded (one extra pass, never a
+retry loop) and is followed by a final head/base/state recheck, so what gets
+recorded is "every required check was green, and nothing newer had appeared,
+as of a PR that is still the one we judged".
 """
 from __future__ import annotations
 
@@ -26,10 +35,10 @@ from pathlib import Path
 from urllib.parse import quote
 
 from hermes_cli.kanban_completion_policy import CONFIG_DOTPATH, configured_required_checks
+from hermes_cli.kanban_github_evidence import SHA_RE, pull_request_problem
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
-_SHA = re.compile(r"[0-9a-f]{40}")
 
 # Evidence failures that mean "GitHub could not answer", not "the card is red".
 _API_FAILURES = (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError)
@@ -170,6 +179,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
         # ``fetched: False`` keeps an empty ``checks`` list from reading as
         # "the checks endpoint returned nothing" when collection aborted first.
         "checks_endpoint": {"fetched": False, "total_count": None, "runs": 0, "statuses": 0, "pages": 0},
+        # ``performed: False`` = the card never got far enough to be worth a
+        # second collection, so ``checks`` is the only pass there was.
+        "recheck": {"performed": False, "checks_endpoint": None, "first_pass": None},
         "recovery": _RECOVERY,
     }
     try:
@@ -201,7 +213,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
         pr = repository["pullRequest"]
         sha, branch = pr["headRefOid"], pr["baseRefName"]
         receipt["head_sha"], receipt["base_ref"] = sha, branch
-        if not _SHA.fullmatch(sha) or pr["state"] not in {"OPEN", "MERGED"}:
+        if not SHA_RE.fullmatch(sha) or pr["state"] not in {"OPEN", "MERGED"}:
             raise ValueError("PR is closed or current head is unavailable")
 
         # Required set = every readable/declared policy, keyed by (context, app id).
@@ -231,32 +243,40 @@ def collect_acceptance(contract: str, published_pr: str | None,
             receipt["detail"] = _no_policy_detail(repo, rules_available, config_problem)
             return receipt
 
-        receipt["phase"] = "check_runs"
-        pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
-                     paginate=True, profile_home=profile_home)
-        runs = [run for page in pages for run in page["check_runs"]]
-        if len({r["id"] for r in runs}) != pages[0]["total_count"]:
-            raise ValueError("Incomplete check-run pagination")
-        receipt["phase"] = "statuses"
-        statuses = [{**s, "sha": sha} for page in
-                    _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100", paginate=True,
-                         profile_home=profile_home) for s in page]
-        receipt["checks_endpoint"] = {"fetched": True, "total_count": pages[0]["total_count"],
-                                     "runs": len(runs), "statuses": len(statuses), "pages": len(pages)}
-
+        runs, statuses = _collect_checks(receipt, repo, sha, profile_home=profile_home)
         receipt["phase"] = "evaluate"
-        outcomes = _evaluate(receipt, required, runs, statuses, sha)
+        verdict = _verdict(_evaluate(receipt, required, runs, statuses, sha))
 
         # Re-read after all pages: old-head successes are never transferable.
         receipt["phase"] = "stale_recheck"
-        current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
-        if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
-            receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
+        moved = _pr_moved(repo, number, sha, branch, profile_home)
+        if moved is not None:
+            receipt.update(**moved)
             return receipt
-        receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
-        receipt["ok"] = receipt["classification"] == "success"
-        if receipt["ok"]:
-            receipt["phase"] = "accepted"
+        if verdict != "success":
+            receipt["classification"] = verdict
+            return receipt
+
+        # Only a card that would otherwise be ACCEPTED pays for a second pass,
+        # and it gets exactly one: a rerun queued against this same head after
+        # the first collection is invisible to the recheck above (the PR head
+        # never moved), so acceptance must rest on evidence re-read after it.
+        runs, statuses = _collect_checks(receipt, repo, sha, prefix="recheck_",
+                                         profile_home=profile_home)
+        receipt["recheck"]["first_pass"], receipt["checks"] = receipt["checks"], []
+        receipt["phase"] = "recheck_evaluate"
+        verdict = _verdict(_evaluate(receipt, required, runs, statuses, sha))
+        if verdict != "success":
+            receipt["classification"] = verdict
+            return receipt
+        # One final head/base/state recheck, so nothing is recorded as accepted
+        # against a PR that moved while the second pass was being read.
+        receipt["phase"] = "final_stale_recheck"
+        moved = _pr_moved(repo, number, sha, branch, profile_home)
+        if moved is not None:
+            receipt.update(**moved)
+            return receipt
+        receipt.update(ok=True, classification="success", phase="accepted")
         return receipt
     except _GateAuthError as exc:
         login = f"assignee profile {assignee!r}'s gh login" if assignee else "the ambient gh login"
@@ -272,6 +292,65 @@ def collect_acceptance(contract: str, published_pr: str | None,
         return receipt
 
 
+def _collect_checks(receipt: dict, repo: str, sha: str, *, prefix: str = "",
+                    profile_home: str | None = None):
+    """Every check run and legacy status GitHub has for the EXACT head.
+
+    ``prefix`` names the pass in the receipt's phase, so a failure during the
+    second collection is never reported as the first one's. Pagination is
+    followed to the end and reconciled against ``total_count``: a page set that
+    does not add up is incomplete evidence, never a green card.
+    """
+    receipt["phase"] = f"{prefix}check_runs"
+    pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
+                 paginate=True, profile_home=profile_home)
+    runs = [run for page in pages for run in page["check_runs"]]
+    if len({r["id"] for r in runs}) != pages[0]["total_count"]:
+        raise ValueError("Incomplete check-run pagination")
+    receipt["phase"] = f"{prefix}statuses"
+    statuses = [{**s, "sha": sha} for page in
+                _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100", paginate=True,
+                     profile_home=profile_home) for s in page]
+    endpoint = {"fetched": True, "total_count": pages[0]["total_count"],
+                "runs": len(runs), "statuses": len(statuses), "pages": len(pages)}
+    if prefix:
+        receipt["recheck"] = {**receipt["recheck"], "performed": True, "checks_endpoint": endpoint}
+    else:
+        receipt["checks_endpoint"] = endpoint
+    return runs, statuses
+
+
+def _verdict(outcomes: list[str]) -> str:
+    """The one classification a set of per-check outcomes adds up to.
+
+    Anything that is not ``success`` wins, and *no* evidence at all is
+    ``missing`` — a required check nobody reported is never a pass.
+    """
+    return next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
+
+
+def _pr_moved(repo: str, number: int, sha: str, branch: str,
+              profile_home: str | None = None) -> dict | None:
+    """``None`` while the PR is still exactly the one the evidence was read for,
+    else the receipt update that refuses it.
+
+    Malformed evidence is kept distinct from a moved PR: "GitHub's answer could
+    not be read" is an infrastructure problem an operator fixes, not a head
+    somebody force-pushed.
+    """
+    current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
+    problem = pull_request_problem(current)
+    if problem is not None:
+        return {"classification": "infra", "detail": (
+            f"GitHub's pull request record is malformed ({problem}), so the exact head could not "
+            f"be rechecked; nothing is accepted on evidence that cannot be read.")}
+    if (current["head"]["sha"] != sha or current["base"]["ref"] != branch
+            or (current["state"] == "closed" and not current["merged"])):
+        return {"classification": "stale",
+                "detail": "PR head/base/state changed while collecting evidence; retry."}
+    return None
+
+
 def _no_policy_detail(repo: str, rules_available: bool, config_problem: str | None) -> str:
     """Why nothing could be required — the one fail-closed case an operator fixes in config."""
     policy = ("GitHub reports no required checks for this base branch"
@@ -285,7 +364,15 @@ def _no_policy_detail(repo: str, rules_available: bool, config_problem: str | No
 
 
 def _evaluate(receipt: dict, required: dict, runs: list, statuses: list, sha: str) -> list[str]:
-    """Classify every required context against exact-head evidence."""
+    """Classify every required context against exact-head evidence.
+
+    The check-run endpoint is asked for ``filter=latest``, and EVERY run it
+    returns for a required context has to be green: when a rerun leaves two
+    runs of the same name on one head, the newer one is as required as the
+    first, so a queued or failed rerun cannot hide behind an older success.
+    Legacy statuses have no such filter and are append-only, so there the
+    highest id is the effective one.
+    """
     outcomes: list[str] = []
     for (context, app_id), source in sorted(required.items(), key=lambda kv: str(kv[0])):
         matching = [r for r in runs if r["name"] == context and

@@ -119,12 +119,25 @@ zero outside a kanban task (footprint ladder rung 3).
   only AFTER the transition's own CAS wins — a normal `return` out of `write_txn` commits, so
   binding earlier let a refused handoff pin a card's PR forever on a run it never owned. Network/git
   work stays OUTSIDE the write txn, and the snapshot rechecked inside it covers EVERY fact the
-  verification approved from, not just ids: statuses/run ids, the declaration, the implementation's
-  contract, the accepted `pr_acceptance` event, and the completed QA run's own summary/metadata
-  (which `edit_task(result=…)` rewrites without touching a single id). Refusals persist a
-  secret-free immutable receipt (never gh/git stderr); "the API could not answer" stays distinct
-  from "not merged yet" (`UNPROVABLE_PHASES`), and a missing/hung `git` is unprovable rather than a
-  raise. Empty `integration_gates` is inert — legacy links keep plain done-parent semantics.
+  verification approved from, not just ids: statuses/run ids, the declaration, **the two
+  `task_links` edges that make implementation/QA the gate's parents** (unlinking one makes
+  `_parents_satisfied` *easier* to satisfy — vacuous with both gone — so the gate asks for them by
+  name), the implementation's contract, the accepted `pr_acceptance` event, and the completed QA
+  run's own summary/metadata (which `edit_task(result=…)` rewrites without touching a single
+  id). Nothing external is trusted by shape or by reference: GitHub's PR JSON is type-checked
+  before any field is read (`kanban_github_evidence`; `merged: "false"` is a TRUTHY string, and
+  `merged is True` is the only merge), the PR's current head must still be the accepted+QA head (a
+  later push that then got merged integrated work nobody judged, and its squash commit looks
+  identical), the tracking ref is resolved ONCE to an exact commit that the ancestry question and
+  the receipt both name (a ref moves under a concurrent fetch), and a card that would be accepted
+  has its check runs/statuses collected a SECOND time plus a final head/base/state recheck — a
+  rerun queues a new run on the same sha, which no PR recheck can see. Both extra passes are
+  bounded at one; never turn either into a retry loop. Refusals persist a secret-free immutable
+  receipt (never gh/git stderr) stamped with the attempt that wrote it
+  (`kanban_completion_attempt`) — the CLI reports only its OWN attempt's receipt, since a rival
+  attempt's lands above the same event floor; "the API could not answer" stays distinct from "not
+  merged yet" (`UNPROVABLE_PHASES`), and a missing/hung `git` is unprovable rather than a raise.
+  Empty `integration_gates` is inert — legacy links keep plain done-parent semantics.
 - **Toolset:** `tools/kanban_tools.py` — `kanban_show, kanban_complete, kanban_request_review,
   kanban_request_changes, kanban_block, kanban_schedule, kanban_heartbeat, kanban_comment,
   kanban_create, kanban_link,

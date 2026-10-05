@@ -81,6 +81,17 @@ login. A login that cannot see the repository is rejected with
 `classification=auth`, naming the profile and repository, instead of a
 retryable infra failure.
 
+A card that would otherwise be accepted has its checks collected a **second**
+time, and the PR rechecked once more after that, before acceptance is recorded.
+A rerun queues a new required run against the *same* head commit, so the PR
+itself never moves and a single pass can record "green" for evidence that is
+already out of date; every required check has to still be `success` on the
+re-read, and a newer queued, running, failed, cancelled, timed-out, skipped,
+neutral or unrecognised run fails closed. It is exactly one extra pass — never a
+retry loop — and the receipt keeps the first pass alongside it. A PR record that
+cannot be read as a pull request (a proxy's error envelope, `merged: "false"` as
+a *string*) is classified as infrastructure trouble, never as an acceptance.
+
 ### Declaring required checks (private repositories on a free plan)
 
 The Repository Rules API answers `403` on a private repository without a paid plan,
@@ -143,20 +154,31 @@ hermes kanban integration-gate configure <gate-card> \
 
 Completing the gate card verifies, and refuses unless it can prove, all of:
 
-1. the Implementation and QA cards are `done`;
-2. QA's latest completed run carries structured `metadata.decision == "PASS"` —
+1. the declared Implementation and QA cards are **still direct parents** of the
+   gate — unlinking one makes the board's own dependency check easier to satisfy
+   (with both gone it is vacuously true), so the gate checks the edges by name;
+2. the Implementation and QA cards are `done`;
+3. QA's latest completed run carries structured `metadata.decision == "PASS"` —
    prose saying "PASS" is never evidence;
-3. QA's `metadata.revision` equals the exact head the PR acceptance receipt passed;
-4. the Implementation card is pinned to an exact PR, and that PR is **merged**;
-5. its base is the configured integration branch;
-6. the merger is a **human** — mandatory for every gate, with no flag, config key
+4. QA's `metadata.revision` equals the exact head the PR acceptance receipt passed;
+5. the Implementation card is pinned to an exact PR, and GitHub's answer for it is
+   structurally a pull request (every field is type-checked before it is read, so
+   `merged: "false"` — a truthy *string* — can never read as a merge);
+6. that PR's **current head is still the head** acceptance passed and QA reviewed:
+   a PR that took another push afterwards and was then merged integrated something
+   nobody judged, and its squash merge commit looks identical either way;
+7. the PR is **merged** (`merged is true`, strictly);
+8. its base is the configured integration branch;
+9. the merger is a **human** — mandatory for every gate, with no flag, config key
    or stored column that relaxes it (a bot merging its own unreviewed work is the
    failure the gate exists to catch), and an actor GitHub reports as a `Bot`, with
-   a `…[bot]` login, or not at all fails closed;
-7. `git fetch <remote> <branch>` succeeds in the configured clone;
-8. the PR's `merge_commit_sha` is an ancestor of the fetched
-   `refs/remotes/<remote>/<branch>` — the *merge commit*, because a squash merge
-   discards the PR head, which would otherwise make every squash unprovable.
+   a `…[bot]` login, in an unreadable shape, or not at all fails closed;
+10. `git fetch <remote> <branch>` succeeds in the configured clone;
+11. the PR's `merge_commit_sha` is an ancestor of the integration branch tip — the
+    *merge commit*, because a squash merge discards the PR head, which would
+    otherwise make every squash unprovable. `refs/remotes/<remote>/<branch>` is
+    mutable, so it is resolved **once** to an exact commit and that captured
+    commit is what the ancestry check asks about and the receipt records.
 
 Anything that cannot be proven blocks the gate, so the downstream card is never
 promoted on unverified work. Nothing here merges, pushes or writes to GitHub.
@@ -177,12 +199,20 @@ commit is not in the branch".
 The GitHub and git work runs with no SQLite transaction open, so every fact the
 verification approved from is fingerprinted beforehand and re-read inside the
 transaction that would complete the card: the gate's run and status, the
-declaration, both parents' statuses and runs, the implementation's pinned
-contract, its accepted `pr_acceptance` receipt, and the completed QA run's own
-summary and metadata. If any of them moved in between — `hermes kanban edit`
-rewriting the completed QA result, a re-declaration, a rival claim — the
-completion is refused rather than promoting the downstream card on evidence that
-no longer exists.
+declaration, both parents' statuses and runs **and the two links that make them
+parents**, the implementation's pinned contract, its accepted `pr_acceptance`
+receipt, and the completed QA run's own summary and metadata. If any of them
+moved in between — `hermes kanban edit` rewriting the completed QA result, a
+`hermes kanban unlink`, a re-declaration, a rival claim — the completion is
+refused rather than promoting the downstream card on evidence that no longer
+exists.
+
+Because several attempts on one card are ordinary (a worker retries, an operator
+completes by hand, two connections race), each attempt carries its own id and
+stamps it on whatever receipt it persists. `hermes kanban complete` reports only
+the receipt matching the attempt it just made, so a concurrent attempt's
+condition is never shown as the reason yours was refused; a refusal no gate wrote
+a receipt for keeps the generic message.
 
 ## Kanban vs. `delegate_task`
 
