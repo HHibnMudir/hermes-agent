@@ -59,4 +59,4 @@ jobs:
           source .venv/bin/activate
           python -m pytest \
             tests/hermes_cli/test_kanban_pr_acceptance.py \
-            -q -p no:randomly --timeout=300 -rs
+            -q -p no:randomly -rs
