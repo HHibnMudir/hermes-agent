@@ -43,7 +43,8 @@ def github(tmp_path, monkeypatch):
             elif "/statuses" in self.path:
                 value = [[]]
             elif "/pulls/" in self.path:
-                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open",
+                         "merged": False}
             else:
                 self.send_error(404)
                 return
