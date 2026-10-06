@@ -1061,6 +1061,38 @@ def test_malformed_pr_evidence_blocks_the_gate_as_unprovable(github, clone, reco
     assert "gh/API access" in receipt["recovery"]
 
 
+@pytest.mark.parametrize("state", ["unknown", "proxy-error", "MERGED", ""])
+def test_a_pr_state_github_never_sends_blocks_an_otherwise_provable_gate(github, clone, state):
+    """REST reports exactly ``open`` or ``closed``; anything else is an answer
+    that did not come from the pull request endpoint's contract.
+
+    The record below is otherwise perfect — the accepted head, a human merger, a
+    merge commit that really is in the fetched branch — so every condition after
+    the shape check would pass and the gate would COMPLETE on a record a proxy
+    or an older host wrote. It blocks as unprovable instead, and the card below
+    it stays unexecutable.
+    """
+    with connect_closing() as conn:
+        _, _, gate_id, child = _graph(conn, github, clone)
+        merge_sha = clone.commit("squash merge of #7")
+        github.merge(merge_sha)
+        github.pull_override = {
+            "head": {"sha": HEAD}, "base": {"ref": "develop"}, "state": state,
+            "merged": True, "merge_commit_sha": merge_sha,
+            "merged_by": {"login": "maintainer", "type": "User"},
+            "merged_at": "2026-10-01T12:00:00Z",
+        }
+
+        assert kb.complete_task(conn, gate_id) is False
+        assert kb.get_task(conn, gate_id).status != "done"
+        assert kb.get_task(conn, child).status == "todo"
+        receipt = _receipt(conn, gate_id)
+    assert receipt["phase"] == "pr_evidence_malformed"
+    assert receipt["phase"] in UNPROVABLE_PHASES
+    assert not _condition(receipt, "pr_evidence_well_formed")["ok"]
+    assert receipt["merge_commit_sha"] is None and receipt["pr_head_sha"] is None
+
+
 def test_a_pr_whose_head_moved_after_acceptance_and_was_then_merged_fails(github, clone):
     """The gate proves the integration of the head acceptance passed and QA
     reviewed. A PR that took another push afterwards and was then merged

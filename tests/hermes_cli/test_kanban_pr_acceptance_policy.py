@@ -599,7 +599,11 @@ def test_the_evidence_is_collected_exactly_twice_and_never_in_a_loop(github):
     {"head": {"sha": HEAD}, "base": {"ref": "  "}, "state": "open", "merged": False},
     {"head": {"sha": HEAD}, "base": {"ref": "main"}, "state": "open", "merged": "true"},
     {"head": {"sha": HEAD}, "base": {"ref": "main"}, "state": "open", "merged": "false"},
-    {"head": {"sha": HEAD}, "base": {"ref": "main"}, "state": 7, "merged": False},
+    # REST reports exactly ``open`` or ``closed``: a proxy's "unknown", a blank,
+    # the GraphQL spelling, a number, a list or a null are all states no gate
+    # condition can act on, and none of them is ``closed``.
+    *({"head": {"sha": HEAD}, "base": {"ref": "main"}, "state": state, "merged": False}
+      for state in ("unknown", "proxy-error", "", "OPEN", 7, ["open"], None)),
 ])
 def test_a_malformed_pr_record_blocks_acceptance_without_raising(github, record):
     """The head recheck dereferences this record field by field, and
@@ -619,6 +623,53 @@ def test_a_malformed_pr_record_blocks_acceptance_without_raising(github, record)
     # The receipt names which field could not be read, never the body itself.
     assert "malformed" in receipt["detail"]
     assert "pull request" in receipt["detail"]
+
+
+def test_a_state_gone_unreadable_by_the_final_recheck_still_refuses(github):
+    """The PR is rechecked twice — once after collection and once more after the
+    second pass — and the final recheck is the last thing between an otherwise
+    green card and acceptance, so it reads the state as strictly as the first."""
+    _declare_checks({"acme/repo": {"required_checks": ["ci/test"]}})
+    github.rules_forbidden = True
+    github.run("ci/test", "success")
+
+    def answer_the_next_read_with_an_unknown_state():
+        github.pull_override = {"head": {"sha": HEAD}, "base": {"ref": "main"},
+                                "state": "proxy-error", "merged": False}
+
+    github.hooks["/pulls/"] = answer_the_next_read_with_an_unknown_state
+    with connect_closing() as conn:
+        tid = _card(conn)
+        assert kb.complete_task(conn, tid, metadata={"published_pr": PR_URL}) is False
+        assert kb.get_task(conn, tid).status != "done"
+        receipt = _receipt(conn, tid)
+    assert receipt["ok"] is False and receipt["classification"] == "infra"
+    assert receipt["phase"] == "final_stale_recheck"
+    assert receipt["recheck"]["performed"] is True
+    assert "malformed" in receipt["detail"] and "proxy-error" not in receipt["detail"]
+
+
+@pytest.mark.parametrize("state,merged,accepted", [
+    ("open", False, True),
+    ("closed", True, True),
+    ("closed", False, False),
+])
+def test_both_states_github_does_send_keep_their_meaning(github, state, merged, accepted):
+    """Strictness about ``state`` must not cost the two values REST reports: a
+    merged PR is ``closed`` and still acceptable evidence, while closed without
+    a merge is the stale case the recheck exists for."""
+    _declare_checks({"acme/repo": {"required_checks": ["ci/test"]}})
+    github.rules_forbidden = True
+    github.run("ci/test", "success")
+    github.pull_override = {"head": {"sha": HEAD}, "base": {"ref": "main"},
+                            "state": state, "merged": merged}
+    with connect_closing() as conn:
+        tid = _card(conn)
+        assert kb.complete_task(conn, tid, metadata={"published_pr": PR_URL}) is accepted
+        receipt = _receipt(conn, tid)
+    assert receipt["ok"] is accepted
+    assert receipt["classification"] == ("success" if accepted else "stale")
+    assert "malformed" not in (receipt.get("detail") or "")
 
 
 def _graphql(pull_request):

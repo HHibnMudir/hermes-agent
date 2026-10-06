@@ -35,6 +35,11 @@ import re
 #: A git object name as GitHub reports it: exactly 40 lowercase hex digits.
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 
+#: Every value REST reports for a pull request's ``state`` — the whole
+#: contract, lowercase. A tuple, not a set: membership then compares by
+#: equality, so an unhashable answer (a list) is refused rather than raising.
+_REST_PR_STATES = ("open", "closed")
+
 
 def is_sha(value) -> bool:
     """True only for an exact 40-character hex object name."""
@@ -105,8 +110,12 @@ def pull_request_problem(pr) -> str | None:
         # The one that matters most: "false" is a non-empty string, so a
         # truthiness test on it reads an unmerged PR as merged.
         return "pull request merged is not a boolean"
-    if nonblank_str(pr.get("state")) is None:
-        return "pull request state is not a status string"
+    if pr.get("state") not in _REST_PR_STATES:
+        # REST answers exactly one of two lowercase words. Any other value is a
+        # state no gate condition can act on: "unknown"/"proxy-error" is a
+        # non-blank string that is not ``closed``, so the stale recheck reads it
+        # as an open PR and the merge condition reports a state nobody sent.
+        return 'pull request state is neither "open" nor "closed"'
     if pr.get("merged_at") is not None and not isinstance(pr.get("merged_at"), str):
         return "pull request merged_at is neither null nor a timestamp string"
     return None
