@@ -117,14 +117,28 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
             tid = kb.create_task(conn, title="race", completion_contract="acme/repo")
             owner = kb.claim_task(conn, tid)
             run_id = owner.current_run_id
+            failures = []
             def reclaim():
-                with connect() as rival:
-                    assert kb.block_task(rival, tid, reason="Reassigned during acceptance")
-                    assert kb.unblock_task(rival, tid)
-                    github["replacement"] = kb.claim_task(rival, tid).current_run_id
+                # A card the gate would otherwise accept has its check runs read
+                # twice (collect, then recheck), so this hook fires once per
+                # pass. ONE rival reclaim is the scenario: a second block of the
+                # same un-typed cause reaches BLOCK_RECURRENCE_LIMIT and routes
+                # to ``triage``, which no unblock can leave.
+                try:
+                    with connect() as rival:
+                        if kb.get_task(rival, tid).current_run_id != run_id:
+                            return
+                        assert kb.block_task(rival, tid, reason="Reassigned during acceptance")
+                        assert kb.unblock_task(rival, tid)
+                        github["replacement"] = kb.claim_task(rival, tid).current_run_id
+                except Exception as exc:  # noqa: BLE001 - re-raised on the main thread
+                    # Raising in the server thread only reaches the gate as an
+                    # opaque API failure, which misreports every assertion below.
+                    failures.append(repr(exc))
             github.update(conclusion=conclusion, race=reclaim)
             assert not kb.complete_task(conn, tid, result="done", expected_run_id=run_id,
                 metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+            assert failures == []
             assert kb.get_task(conn, tid).current_run_id == github["replacement"]
             assert github["replacement"] != run_id
             assert kb.get_task(conn, tid).status != "done"
