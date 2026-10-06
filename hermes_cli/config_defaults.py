@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- opt-in fail-closed completion gates: a repository whose GitHub policy is unreadable (403 on a private repo without a paid plan) can only be judged against a DECLARED policy, so the gate needs one new kanban key here; this is a pure-data defaults file and the long form lives in website/docs/user-guide/features/kanban.md
 """Default configuration data for Hermes Agent: DEFAULT_CONFIG and OPTIONAL_ENV_VARS.
 
 Pure-data leaf module — must not import from hermes_cli.config. Comments are the user-facing
@@ -1954,17 +1955,11 @@ DEFAULT_CONFIG = {
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.
         "reconcile_orphans": True,
-        # Required CI checks per repository for cards whose `completion_contract` names a GitHub
-        # repo or exact PR. Keys are "OWNER/REPO"; each entry declares the checks that must exist
-        # on the PR's exact head AND be successful before completion is accepted. GitHub's own
-        # policy (classic branch protection + Repository Rules) is read first and unioned with
-        # this; the declaration is what makes a private repo on a free plan completable, since
-        # the Rules API answers 403 there. A repo with neither a readable GitHub policy nor an
-        # entry here can never satisfy a repository contract — all-green-observed is deliberately
-        # NOT a substitute for a declared policy. Use a `local-only` contract for non-CI work.
-        #   completion_checks:
-        #     "acme/repo":
-        #       required_checks: ["build", "unit-tests"]
+        # {"OWNER/REPO": {"required_checks": [...]}} — checks that must exist on a completion
+        # contract PR's exact head AND be green, unioned with GitHub's own readable policy. The
+        # declaration is what makes a private repo on a free plan completable (the Rules API
+        # answers 403 there); with no policy from either source a repository contract can never
+        # be satisfied. Guide: website/docs/user-guide/features/kanban.md#declaring-required-checks
         "completion_checks": {},
         # Notify subscriptions survive `done` (completion is reversible) and are removed on archive.
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no

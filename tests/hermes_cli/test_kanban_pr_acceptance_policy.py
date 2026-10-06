@@ -671,7 +671,7 @@ def test_a_state_gone_unreadable_by_the_final_recheck_still_refuses(github):
     github.hooks["/pulls/"] = answer_the_next_read_with_an_unknown_state
     with connect_closing() as conn:
         tid = _card(conn)
-        assert kb.complete_task(conn, tid, metadata={"published_pr": PR_URL}) is False
+        assert kb.complete_task(conn, tid, summary="handoff", metadata={"published_pr": PR_URL}) is False
         assert kb.get_task(conn, tid).status != "done"
         receipt = _receipt(conn, tid)
     assert receipt["ok"] is False and receipt["classification"] == "infra"
@@ -696,7 +696,7 @@ def test_both_states_github_does_send_keep_their_meaning(github, state, merged, 
                             "state": state, "merged": merged}
     with connect_closing() as conn:
         tid = _card(conn)
-        assert kb.complete_task(conn, tid, metadata={"published_pr": PR_URL}) is accepted
+        assert kb.complete_task(conn, tid, summary="handoff", metadata={"published_pr": PR_URL}) is accepted
         receipt = _receipt(conn, tid)
     assert receipt["ok"] is accepted
     assert receipt["classification"] == ("success" if accepted else "stale")

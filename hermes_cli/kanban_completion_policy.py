@@ -73,12 +73,17 @@ def configured_required_checks(repo: str) -> tuple[list[str], str | None]:
 
 def _completion_checks_section() -> tuple[dict, str | None]:
     """``kanban.completion_checks`` as a mapping, plus a problem description."""
+    from hermes_yaml import YAMLError
+
     try:
         from hermes_cli.config import load_config_readonly
 
         config = load_config_readonly()
-    except Exception:
-        # Unreadable/unparseable config is an operator problem, not an API one.
+    except (OSError, YAMLError, ValueError):
+        # The two ways a config read fails: the file cannot be read (OSError) or
+        # cannot be parsed (YAMLError/ValueError). Both are an operator problem,
+        # reported as one — never raised, since a bad config line must read as
+        # "fix this line" on the receipt, not as a GitHub API failure.
         return {}, "config.yaml could not be loaded, so no required checks are declared"
     kanban_cfg = config.get("kanban") if isinstance(config, dict) else None
     section = kanban_cfg.get("completion_checks") if isinstance(kanban_cfg, dict) else None

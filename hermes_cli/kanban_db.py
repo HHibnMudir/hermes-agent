@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- opt-in fail-closed completion gates: the verification, the receipts and the snapshot discipline all live in siblings (kanban_pr_acceptance*, kanban_integration_gate*, kanban_completion_attempt); what lands here is the declaration table in the schema constant plus the minimal prepare/record wiring at the two existing transition chokepoints (complete_task, request_review), which is where a terminal transition can be refused at all
 """SQLite-backed Kanban board shared across profiles (the cross-profile coordination primitive).
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards

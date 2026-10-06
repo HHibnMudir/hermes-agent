@@ -1083,7 +1083,7 @@ def test_a_pr_state_github_never_sends_blocks_an_otherwise_provable_gate(github,
             "merged_at": "2026-10-01T12:00:00Z",
         }
 
-        assert kb.complete_task(conn, gate_id) is False
+        assert kb.complete_task(conn, gate_id, summary="gate completion") is False
         assert kb.get_task(conn, gate_id).status != "done"
         assert kb.get_task(conn, child).status == "todo"
         receipt = _receipt(conn, gate_id)
