@@ -54,9 +54,12 @@ jobs:
             --extra hindsight \
             --extra parallel-web
 
-      - name: Run Linux acceptance-policy tests
+      - name: Run canonical Linux acceptance tests
         run: |
           source .venv/bin/activate
-          python -m pytest \
-            tests/hermes_cli/test_kanban_pr_acceptance.py \
-            -q -p no:randomly -rs
+          scripts/run_tests.sh --files tests/hermes_cli/test_kanban_pr_acceptance.py
+        env:
+          HERMES_TEST_WORKERS: 1
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
