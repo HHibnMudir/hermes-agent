@@ -170,7 +170,7 @@ def test_acceptance_runs_gh_as_the_assignee_profile(tmp_path, monkeypatch):
     shim.mkdir()
     gh = shim / "gh"
     gh.write_text(f"#!{sys.executable}\nimport json, os\n"
-                  f"json.dump(dict(os.environ), open({str(env_dump)!r}, 'w'))\n"
+                  f"json.dump(dict(os.environ), open({str(env_dump)!r}, 'w', encoding='utf-8'))\n"  # windows-footgun: ok -- mode 'w' is a WRITE; policy is utf-8 for writes
                   "print(json.dumps({'data': {'repository': None}}))\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
@@ -184,7 +184,7 @@ def test_acceptance_runs_gh_as_the_assignee_profile(tmp_path, monkeypatch):
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))]
         assert receipts[-1]["classification"] == "auth"
         assert "acme/repo" in receipts[-1]["detail"]
-    captured = json.loads(env_dump.read_text())
+    captured = json.loads(env_dump.read_text(encoding="utf-8-sig"))
     assert captured["GH_TOKEN"] == "b-token"
     assert captured.get("GH_CONFIG_DIR") != "/nonexistent/launch/gh"
     assert "credentials" in (kb.get_task(conn, tid).last_failure_error or "")

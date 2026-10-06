@@ -127,7 +127,8 @@ def github(monkeypatch):
 def _declare_checks(entry):
     home = Path(os.environ["HERMES_HOME"])
     home.mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text(yaml.safe_dump({"kanban": {"completion_checks": entry}}))
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"kanban": {"completion_checks": entry}}), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------

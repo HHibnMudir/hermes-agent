@@ -150,7 +150,8 @@ def _declare_checks(entry):
     """Write ``kanban.completion_checks`` to the temp home's real config.yaml."""
     home = Path(os.environ["HERMES_HOME"])
     home.mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text(yaml.safe_dump({"kanban": {"completion_checks": entry}}))
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"kanban": {"completion_checks": entry}}), encoding="utf-8")
 
 
 def _live_profile(name):
