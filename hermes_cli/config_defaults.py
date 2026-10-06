@@ -1959,7 +1959,7 @@ DEFAULT_CONFIG = {
         # contract PR's exact head AND be green, unioned with GitHub's own readable policy. The
         # declaration is what makes a private repo on a free plan completable (the Rules API
         # answers 403 there); with no policy from either source a repository contract can never
-        # be satisfied. Guide: website/docs/user-guide/features/kanban.md#declaring-required-checks
+        # be satisfied. Guide: kanban.md > "Declaring required checks" (user-guide/features).
         "completion_checks": {},
         # Notify subscriptions survive `done` (completion is reversible) and are removed on archive.
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
