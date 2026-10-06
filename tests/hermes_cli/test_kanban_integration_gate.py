@@ -1234,11 +1234,13 @@ def test_a_concurrent_attempts_receipt_is_never_reported_as_this_ones_reason(git
     attempt-id match may be reported.
     """
     from hermes_cli import kanban as kc
-    from hermes_cli.kanban_completion_attempt import new_completion_attempt_id
+    from hermes_cli.kanban_completion_attempt import (
+        completion_refusal, latest_event_id, new_completion_attempt_id,
+    )
 
     with connect_closing() as conn:
         impl, qa, gate_id, child = _graph(conn, github, clone)
-        floor = kc._latest_event_id(conn, gate_id)
+        floor = latest_event_id(conn, gate_id)
         attempt = new_completion_attempt_id()
 
         def rival_attempt_then_block_the_parents():
@@ -1259,7 +1261,7 @@ def test_a_concurrent_attempts_receipt_is_never_reported_as_this_ones_reason(git
         assert kb.get_task(conn, child).status == "todo"
 
         # This attempt wrote no receipt, so it has nothing of its own to report…
-        assert kc._completion_refusal(conn, gate_id, floor, attempt) is None
+        assert completion_refusal(conn, gate_id, floor, attempt) is None
         # …even though the rival's receipt does sit above its floor.
         rival_receipt = _receipt(conn, gate_id)
         assert rival_receipt["completion_attempt_id"] not in (None, attempt)
@@ -1274,12 +1276,13 @@ def test_a_concurrent_attempts_receipt_is_never_reported_as_this_ones_reason(git
 def test_two_refusals_on_one_card_each_report_their_own_receipt(github, clone):
     """The ordinary case the same stamp has to get right: two attempts, two
     different unproven conditions, each read back from the same event floor."""
-    from hermes_cli import kanban as kc
-    from hermes_cli.kanban_completion_attempt import new_completion_attempt_id
+    from hermes_cli.kanban_completion_attempt import (
+        completion_refusal, latest_event_id, new_completion_attempt_id,
+    )
 
     with connect_closing() as conn:
         _, _, gate_id, _ = _graph(conn, github, clone)
-        floor = kc._latest_event_id(conn, gate_id)
+        floor = latest_event_id(conn, gate_id)
 
         waiting = new_completion_attempt_id()
         assert kb.complete_task(conn, gate_id, summary="gate completion", completion_attempt_id=waiting) is False
@@ -1288,9 +1291,9 @@ def test_two_refusals_on_one_card_each_report_their_own_receipt(github, clone):
         assert kb.complete_task(conn, gate_id, summary="gate completion", completion_attempt_id=unprovable) is False
 
         # Same floor, two ids, two correct answers — the id is what separates them.
-        assert "waiting_for_merge" in kc._completion_refusal(conn, gate_id, floor, waiting)
-        assert "pr_unreadable" in kc._completion_refusal(conn, gate_id, floor, unprovable)
-        assert kc._completion_refusal(conn, gate_id, floor, new_completion_attempt_id()) is None
+        assert "waiting_for_merge" in completion_refusal(conn, gate_id, floor, waiting)
+        assert "pr_unreadable" in completion_refusal(conn, gate_id, floor, unprovable)
+        assert completion_refusal(conn, gate_id, floor, new_completion_attempt_id()) is None
 
 
 def test_the_cli_declares_inspects_and_removes_a_gate(github, clone):

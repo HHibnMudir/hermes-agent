@@ -32,6 +32,9 @@ PR_URL = "https://github.com/acme/repo/pull/7"
 HEAD = "a" * 40
 OTHER_HEAD = "b" * 40
 
+#: "No override installed", so a test can still override with ``None``.
+_UNSET = object()
+
 
 class FakeGitHub:
     """``gh api`` responses in the shapes GitHub actually returns.
@@ -55,6 +58,9 @@ class FakeGitHub:
         #: Stands in for the ``/pulls/{n}`` record verbatim, so a test can hand
         #: the collector a shape GitHub would never send.
         self.pull_override = None
+        #: The same for the GraphQL answer: the whole response envelope
+        #: verbatim, including the levels above ``pullRequest``.
+        self.graphql_override = _UNSET
         self.calls = []
         self.hooks = {}
 
@@ -81,7 +87,11 @@ class FakeGitHub:
     def __call__(self, endpoint, *, query=None, paginate=False, profile_home=None):
         self.calls.append(endpoint)
         hook = next((fn for key, fn in self.hooks.items() if key in endpoint), None)
-        if endpoint == "graphql":
+        if endpoint == "graphql" and self.graphql_override is not _UNSET:
+            # ``None`` is itself a shape GitHub can answer, so the override has
+            # its own sentinel rather than using None for "not overridden".
+            value = self.graphql_override
+        elif endpoint == "graphql":
             protection = (
                 {"requiredStatusChecks": [{"context": c, "app": {"databaseId": a}}
                                           for c, a in self.protection_contexts]}
@@ -640,6 +650,164 @@ def test_a_malformed_pr_record_blocks_acceptance_without_raising(github, record)
     # The receipt names which field could not be read, never the body itself.
     assert "malformed" in receipt["detail"]
     assert "pull request" in receipt["detail"]
+
+
+def _graphql(pull_request):
+    """The acceptance query's envelope around one ``pullRequest`` value."""
+    return {"data": {"repository": {"pullRequest": pull_request}}}
+
+
+def _pull_request(**overrides):
+    """GitHub's answer for an ordinary open PR with no protection rule."""
+    return {"headRefOid": HEAD, "baseRefName": "main", "state": "OPEN",
+            "baseRef": {"branchProtectionRule": None}, **overrides}
+
+
+def _protected(required_status_checks):
+    return _pull_request(baseRef={"branchProtectionRule": {
+        "requiredStatusChecks": required_status_checks}})
+
+
+#: Every level of the consumed GraphQL envelope, each broken the way a proxy's
+#: error page, an enterprise host's older schema or a partial-error answer
+#: breaks it: a string, a list or a number where an object, a sha, a branch
+#: name, a check list or an app id belongs.
+_MALFORMED_GRAPHQL = {
+    "response is a string": "not-an-object",
+    "response is a list": [],
+    "response carries no data": {},
+    "data is a string": {"data": "bad"},
+    "data carries no repository": {"data": {}},
+    "repository is a list": {"data": {"repository": []}},
+    "repository is a string": {"data": {"repository": "bad"}},
+    "pullRequest is a string": _graphql("bad"),
+    "pullRequest is null": _graphql(None),
+    "headRefOid is null": _graphql(_pull_request(headRefOid=None)),
+    "headRefOid is not a sha": _graphql(_pull_request(headRefOid="HEAD")),
+    "headRefOid is a number": _graphql(_pull_request(headRefOid=7)),
+    "baseRefName is blank": _graphql(_pull_request(baseRefName="   ")),
+    "baseRefName is a list": _graphql(_pull_request(baseRefName=["main"])),
+    "state is null": _graphql(_pull_request(state=None)),
+    "state is a number": _graphql(_pull_request(state=7)),
+    "baseRef is a string": _graphql(_pull_request(baseRef="not-an-object")),
+    "baseRef is a list": _graphql(_pull_request(baseRef=[])),
+    "branchProtectionRule is a list": _graphql(
+        _pull_request(baseRef={"branchProtectionRule": []})),
+    "branchProtectionRule is a string": _graphql(
+        _pull_request(baseRef={"branchProtectionRule": "bad"})),
+    "requiredStatusChecks is a string": _graphql(_protected("bad")),
+    "requiredStatusChecks is an object": _graphql(_protected({"nodes": []})),
+    "a required check is a string": _graphql(_protected(["ci/test"])),
+    "a required check is null": _graphql(_protected([None])),
+    "a required check context is blank": _graphql(_protected([{"context": "  "}])),
+    "a required check context is a number": _graphql(_protected([{"context": 7}])),
+    "a required check has no context": _graphql(_protected([{"app": {"databaseId": 1}}])),
+    "a required check app is a string": _graphql(
+        _protected([{"context": "ci/test", "app": "bad"}])),
+    "a required check app is a list": _graphql(
+        _protected([{"context": "ci/test", "app": []}])),
+    "app databaseId is a string": _graphql(
+        _protected([{"context": "ci/test", "app": {"databaseId": "1"}}])),
+    "app databaseId is a bool": _graphql(
+        _protected([{"context": "ci/test", "app": {"databaseId": True}}])),
+    "app databaseId is a list": _graphql(
+        _protected([{"context": "ci/test", "app": {"databaseId": []}}])),
+    "a later required check is malformed": _graphql(_protected(
+        [{"context": "ci/test", "app": {"databaseId": 1}}, {"context": "ci/lint", "app": 7}])),
+}
+
+
+def test_an_explicit_null_repository_is_an_identity_refusal_not_malformed(github):
+    """GitHub answers ``repository: null`` for a repo the login cannot see, so
+    that one shape is the ``auth`` classification an operator fixes by signing
+    the assignee profile in (#122689) — never ``infra``, which reads as "retry",
+    and never a traceback. A MISSING repository key stays malformed."""
+    _declare_checks({"acme/repo": {"required_checks": ["ci/test"]}})
+    github.run("ci/test", "success")
+    github.graphql_override = {"data": {"repository": None}}
+    with connect_closing() as conn:
+        tid = _card(conn)
+        assert kb.complete_task(conn, tid, summary="handoff", metadata={"published_pr": PR_URL}) is False
+        receipt = _receipt(conn, tid)
+    assert receipt["ok"] is False and receipt["classification"] == "auth"
+    assert "acme/repo" in receipt["detail"]
+    assert not any("check-runs" in call for call in github.calls)
+
+
+@pytest.mark.parametrize("payload", list(_MALFORMED_GRAPHQL.values()),
+                         ids=list(_MALFORMED_GRAPHQL))
+def test_a_malformed_graphql_envelope_blocks_acceptance_without_raising(github, payload):
+    """The first hop's answer nests four levels deep before the first field the
+    gate reads, and every level is one GitHub may answer ``null`` for.
+
+    Each of these shapes used to be dereferenced on trust: the object-or-null
+    levels raised ``AttributeError`` (``"not-an-object".get(...)``), which is not
+    an API failure the collector converts, so a malformed answer aborted
+    ``complete_task`` with a traceback instead of blocking it with a receipt.
+    None of them may read as acceptance either — the card below is otherwise
+    green and declared, so a partial read would accept it.
+    """
+    _declare_checks({"acme/repo": {"required_checks": ["ci/test"]}})
+    github.run("ci/test", "success")
+    github.graphql_override = payload
+    with connect_closing() as conn:
+        tid = _card(conn)
+        assert kb.complete_task(conn, tid, summary="handoff", metadata={"published_pr": PR_URL}) is False
+        assert kb.get_task(conn, tid).status != "done"
+        receipt = _receipt(conn, tid)
+    assert receipt["ok"] is False and receipt["classification"] == "infra"
+    assert receipt["phase"] == "pr_resolve"
+    # The receipt names the field that could not be read…
+    assert "malformed" in receipt["detail"]
+    # …and no evidence was collected against an unread head.
+    assert receipt["head_sha"] is None and receipt["base_ref"] is None
+    assert receipt["checks"] == [] and receipt["required"] == []
+    assert receipt["checks_endpoint"]["fetched"] is False
+    assert [c for c in github.calls if "graphql" not in c] == []
+
+
+def test_a_malformed_graphql_receipt_never_quotes_the_response_body(github):
+    """A GraphQL answer can carry a token or host detail (a proxy's auth error
+    page lands in exactly this position), and receipts are immutable board
+    history: the receipt reports which field was unreadable, never its value."""
+    secret = "ghp_averyrealisticlookingtokenvalue"
+    _declare_checks({"acme/repo": {"required_checks": ["ci/test"]}})
+    github.run("ci/test", "success")
+    github.graphql_override = _graphql(_pull_request(baseRef=secret))
+    with connect_closing() as conn:
+        tid = _card(conn)
+        assert kb.complete_task(conn, tid, summary="handoff", metadata={"published_pr": PR_URL}) is False
+        receipt = _receipt(conn, tid)
+        task = kb.get_task(conn, tid)
+    assert secret not in json.dumps(receipt)
+    assert secret not in (task.last_failure_error or "")
+    assert "baseRef" in receipt["detail"]
+
+
+def test_a_null_protection_rule_and_null_app_id_stay_ordinary_answers(github):
+    """Fail-closed must not mean fail-on-``null``: GitHub legitimately answers
+    ``null`` for ``baseRef``, for a repository with no protection rule, for a
+    rule that requires no checks, and for a check pinned to no app."""
+    _declare_checks({"acme/repo": {"required_checks": []}})
+    github.run("ci/test", "success")
+    github.legacy_status("ci/test", "success")
+    for pull_request in (
+        _pull_request(baseRef=None),
+        _pull_request(baseRef={"branchProtectionRule": None}),
+        _protected(None),
+        _protected([{"context": "ci/test", "app": None}]),
+        _protected([{"context": "ci/test"}]),
+    ):
+        github.graphql_override = _graphql(pull_request)
+        with connect_closing() as conn:
+            tid = _card(conn)
+            accepted = kb.complete_task(conn, tid, summary="handoff", metadata={"published_pr": PR_URL})
+            receipt = _receipt(conn, tid)
+        # No declared policy for the first three: fail closed on the POLICY,
+        # never on the shape — and the shape must not be the thing that refused.
+        assert "malformed" not in (receipt.get("detail") or "")
+        assert receipt["head_sha"] == HEAD and receipt["base_ref"] == "main"
+        assert accepted is bool(receipt["required"])
 
 
 def test_local_only_cards_never_reach_github(github):

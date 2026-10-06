@@ -28,7 +28,9 @@ from hermes_cli.kanban_output import (
     _task_to_dict,
 )
 from hermes_cli.kanban_boards import _dispatch_boards
-from hermes_cli.kanban_completion_attempt import new_completion_attempt_id, refusal_receipt
+from hermes_cli.kanban_completion_attempt import (
+    completion_refusal, latest_event_id, new_completion_attempt_id,
+)
 from hermes_cli.kanban_integration_gate_cli import _dispatch_integration_gate
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
@@ -893,63 +895,6 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: 
     return None
 
 
-#: Receipt kinds the two opt-in completion gates append, and how to name them.
-_COMPLETION_GATE_EVENTS = {
-    "integration_acceptance": "integration gate",
-    "pr_acceptance": "PR acceptance",
-}
-
-
-def _latest_event_id(conn, task_id: str) -> int:
-    """Highest event id on the task right now — a cheap floor bounding how far
-    back a refusal lookup has to scan."""
-    row = conn.execute(
-        "SELECT MAX(id) AS id FROM task_events WHERE task_id = ?", (task_id,)).fetchone()
-    return int(row["id"] or 0) if row is not None else 0
-
-
-def _completion_refusal(conn, task_id: str, event_floor: int,
-                        attempt_id: str) -> Optional[str]:
-    """Why ``complete_task`` actually refused, when it left a receipt behind.
-
-    Both opt-in gates persist their receipt (and the card's
-    ``last_failure_error``) in the very transaction that refuses the transition,
-    stamped with the attempt that wrote it — and only an exact
-    ``attempt_id`` match is reported here. The event floor alone was not enough:
-    the gates verify GitHub/git with no transaction open, so a receipt another
-    connection writes meanwhile also sits above this attempt's floor, and
-    reporting it blames this operator for a condition another attempt hit.
-
-    Without a receipt of its own the caller keeps the generic message: the
-    refusal really was an unknown id, a terminal/ineligible status, unsatisfied
-    parents or a lost run race, none of which a gate explains.
-    """
-    found = refusal_receipt(conn, task_id, attempt_id, event_floor)
-    if found is None:
-        return None
-    kind, receipt = found
-    if receipt.get("ok"):
-        return None
-    label = _COMPLETION_GATE_EVENTS[kind]
-    phase = str(receipt.get("phase") or "").strip()
-    verdict = str(receipt.get("classification") or "").strip()
-    if verdict and verdict != phase:
-        # PR acceptance: the verdict is the answer and ``phase`` only records how
-        # far collection got (a red required check leaves it at the harmless
-        # ``stale_recheck``), so neither alone tells the operator what happened.
-        stop = verdict + (f" at the {phase} phase" if phase else "")
-    else:
-        stop = phase or "refused"
-    rest = [str(receipt.get(key) or "").strip() for key in ("detail", "recovery")]
-    if not any(rest):
-        # A receipt without prose still left the card's own rendering behind.
-        task = kb.get_task(conn, task_id)
-        rest = [(getattr(task, "last_failure_error", None) or "").strip() if task else ""]
-    return " ".join([f"cannot complete {task_id}: {label} refused — {stop}.",
-                     *(part if part.endswith((".", "!", "?")) else f"{part}."
-                       for part in rest if part)])
-
-
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids, rc = _require_ids(args)
@@ -976,7 +921,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = gate_err
                 return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
-            event_floor = _latest_event_id(conn, tid)
+            event_floor = latest_event_id(conn, tid)
             # This attempt's own id: the gates stamp it onto whatever receipt
             # they persist, so a concurrent attempt's receipt can never be read
             # back as this one's reason.
@@ -998,7 +943,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             if not done:
                 # A completion gate that refused left the real reason behind;
                 # "unknown id or terminal state" is for when nothing did.
-                refusal = _completion_refusal(conn, tid, event_floor, attempt_id)
+                refusal = completion_refusal(conn, tid, event_floor, attempt_id)
                 if refusal:
                     fail_msg[tid] = refusal
                 else:

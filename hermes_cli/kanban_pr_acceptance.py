@@ -17,6 +17,13 @@ had reported nothing. Rules unavailability is now recorded and collection
 continues against the declared policy (``kanban.completion_checks``); every
 other endpoint this gate needs stays mandatory and fails closed.
 
+Nothing GitHub answers is trusted by shape. The GraphQL envelope the first hop
+consumes nests four levels deep before the first field this gate reads, and
+every level of it is an object the API may answer ``null`` for — so the whole
+envelope is validated in ``kanban_github_evidence`` before any dereference, and
+an answer that cannot be read blocks with an ``infra`` receipt at the phase it
+was read in, never with an ``AttributeError`` out of the middle of a completion.
+
 Collection happens TWICE for a card that would otherwise be accepted. A rerun
 queues a new run against the SAME head commit, so a single pass could read
 "green" and then be recorded as acceptance while a fresh required run was
@@ -35,7 +42,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 from hermes_cli.kanban_completion_policy import CONFIG_DOTPATH, configured_required_checks
-from hermes_cli.kanban_github_evidence import SHA_RE, pull_request_problem
+from hermes_cli.kanban_github_evidence import (
+    graphql_pull_request_evidence, pull_request_problem)
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
@@ -206,22 +214,41 @@ def collect_acceptance(contract: str, published_pr: str | None,
         query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state
             baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}''' % (
                 json.dumps(owner), json.dumps(name), number)
-        repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
-        if repository is None:
-            # A private repo the login cannot read resolves to null, not an error.
+        envelope = _api("graphql", query=query, profile_home=profile_home)
+        if (isinstance(envelope, dict) and isinstance(envelope.get("data"), dict)
+                and "repository" in envelope["data"]
+                and envelope["data"]["repository"] is None):
+            # An EXPLICIT ``repository: null`` is not a malformed answer: it is
+            # how GraphQL reports a repository this login cannot see, which is
+            # an identity problem (#122689), not infrastructure. Checked before
+            # the shape validator, which would otherwise call the same null
+            # "data.repository is not an object". A MISSING key is a different
+            # fact — the envelope is not the one this query asked for — and
+            # falls through to the validator as malformed.
             raise _GateAuthError(f"HTTP 404 on graphql {repo}")
-        pr = repository["pullRequest"]
+        # The whole consumed envelope is shape-checked before the first
+        # dereference: every level of it is an object GitHub may answer null
+        # for, so a proxy's error envelope or an older host schema could put a
+        # string or a list where the gate expects one and abort a completion
+        # with an AttributeError/TypeError instead of a receipt.
+        pr, protection_checks, problem = graphql_pull_request_evidence(envelope)
+        if problem is not None:
+            # "GitHub's answer could not be read" is infrastructure trouble an
+            # operator fixes, never a verdict about the card — and the receipt
+            # names the unreadable field, never the body (tokens, host detail).
+            receipt.update(classification="infra", detail=(
+                f"GitHub's GraphQL pull request evidence is malformed ({problem}), so the exact "
+                f"head could not be read; nothing is accepted on evidence that cannot be read."))
+            return receipt
         sha, branch = pr["headRefOid"], pr["baseRefName"]
         receipt["head_sha"], receipt["base_ref"] = sha, branch
-        if not SHA_RE.fullmatch(sha) or pr["state"] not in {"OPEN", "MERGED"}:
-            raise ValueError("PR is closed or current head is unavailable")
+        if pr["state"] not in {"OPEN", "MERGED"}:
+            raise ValueError("PR is closed")
 
         # Required set = every readable/declared policy, keyed by (context, app id).
         required: dict[tuple, str] = {}
-        protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
-        for rule in protection.get("requiredStatusChecks", []):
-            required.setdefault((rule["context"], (rule.get("app") or {}).get("databaseId")),
-                                "branch_protection")
+        for key in protection_checks:
+            required.setdefault(key, "branch_protection")
         receipt["phase"] = "repository_rules"
         rules_contexts, rules_available, rules_reason = _repository_rules_required(
             repo, branch, profile_home)
