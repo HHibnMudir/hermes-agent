@@ -365,6 +365,28 @@ def _digest(parts) -> str:
     ).hexdigest()
 
 
+def _is_canonical_acceptance(payload: dict) -> bool:
+    """Whether ``payload`` is the one receipt shape PR acceptance writes when it
+    accepts (``collect_acceptance``'s ``ok=True, classification="success",
+    phase="accepted"``).
+
+    All three are compared exactly, and ``ok`` by identity, because this payload
+    is JSON read back off the event log rather than a value this process
+    produced: ``"false"`` and ``1`` both pass a truthiness test and ``1``
+    passes an equality one, so a hand-written, half-written or
+    differently-versioned event could otherwise hand the gate an accepted head
+    that no PR acceptance ever approved — and promote the gate's child on it.
+    The two verdict fields are in the test because they are what names the
+    verdict: ``ok`` is the only field a refusal receipt and an acceptance
+    receipt share a key for.
+    """
+    return (
+        payload.get("ok") is True
+        and payload.get("classification") == "success"
+        and payload.get("phase") == "accepted"
+    )
+
+
 def _accepted_acceptance_receipt(conn, implementation_task_id: str):
     """``(event_id, raw_payload, payload)`` of the newest ACCEPTED
     ``pr_acceptance`` receipt on the implementation card, else
@@ -372,14 +394,17 @@ def _accepted_acceptance_receipt(conn, implementation_task_id: str):
 
     That receipt is the only durable record of which exact head GitHub
     acceptance actually passed, which is the head QA's revision must match — so
-    both WHICH event it is and what it says belong in the snapshot.
+    both WHICH event it is and what it says belong in the snapshot. Anything
+    that is not the canonical accepted shape is not a receipt at all here: no
+    accepted head is projected from it, which is the refusal the gate's
+    ``accepted_head_known`` condition already reports.
     """
     for row in conn.execute(
         "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'pr_acceptance' "
         "ORDER BY id DESC", (implementation_task_id,),
     ):
         payload = _json_dict(row["payload"])
-        if payload.get("ok"):
+        if _is_canonical_acceptance(payload):
             return int(row["id"]), row["payload"], payload
     return None, None, {}
 

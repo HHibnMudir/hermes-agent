@@ -598,6 +598,140 @@ def test_an_implementation_without_an_accepted_receipt_blocks_the_gate(github, c
     assert receipt["phase"] == "implementation_done"
 
 
+# --------------------------------------------------------------------------
+# H1's acceptance receipt is read strictly, never truthily
+# --------------------------------------------------------------------------
+
+#: The condition that fails when the implementation card carries no acceptance
+#: receipt the gate will read — which is what every refusal below comes out as.
+_ACCEPTED_HEAD = "accepted_head_known"
+
+#: The required fields the gate projects out of an accepted receipt, valued so
+#: that every condition AFTER the acceptance read is satisfiable: this head is
+#: the one ``_passing_qa`` reviews and this PR is the implementation's pinned
+#: contract. Every row below therefore stands or falls on its verdict alone.
+_VALID_ACCEPTANCE_FIELDS = {"head_sha": HEAD, "pr_url": PR_URL}
+
+#: The one ``pr_acceptance`` payload shape that IS H1 acceptance:
+#: ``collect_acceptance``'s ``ok=True, classification="success", phase="accepted"``.
+_CANONICAL_ACCEPTANCE = {
+    "ok": True, "classification": "success", "phase": "accepted", **_VALID_ACCEPTANCE_FIELDS,
+}
+
+#: Payloads the gate must never read as H1 acceptance. ``ok`` alone is the only
+#: key an accepted and a refused receipt share, so a truthiness test on it
+#: admits every one of these — including two that are not even trying to say
+#: yes — and each carries required fields good enough to promote the gate's
+#: child on evidence H1 never approved.
+_NONCANONICAL_ACCEPTANCE = {
+    # A non-empty string is truthy, and this one says the opposite of accepted.
+    "ok_is_the_string_false": {
+        "ok": "false", "classification": "success", "phase": "accepted",
+        **_VALID_ACCEPTANCE_FIELDS},
+    # ``1 == True`` in Python, so even an equality test on ``ok`` admits this.
+    "ok_is_one": {
+        "ok": 1, "classification": "success", "phase": "accepted",
+        **_VALID_ACCEPTANCE_FIELDS},
+    "no_classification": {"ok": True, "phase": "accepted", **_VALID_ACCEPTANCE_FIELDS},
+    "no_phase": {"ok": True, "classification": "success", **_VALID_ACCEPTANCE_FIELDS},
+    # Collection got all the way to the last recheck and then stopped: the
+    # success verdict is there, the phase that records reaching acceptance is not.
+    "phase_is_not_accepted": {
+        "ok": True, "classification": "success", "phase": "final_stale_recheck",
+        **_VALID_ACCEPTANCE_FIELDS},
+    "classification_is_not_success": {
+        "ok": True, "classification": "stale", "phase": "accepted",
+        **_VALID_ACCEPTANCE_FIELDS},
+    # Well-formed required fields under a verdict written to a contract H1 does
+    # not have: the keys that carry its verdict are simply absent.
+    "noncanonical_h1_contract": {
+        "ok": True, "status": "accepted", "verdict": "success", "accepted": True,
+        **_VALID_ACCEPTANCE_FIELDS},
+    # The incomplete receipt: a truthy ``ok`` and nothing else at all.
+    "nothing_but_a_truthy_ok": {"ok": True},
+}
+
+
+def _rewrite_acceptance(conn, impl, payload):
+    """Replace the implementation's ``pr_acceptance`` receipt with ``payload``.
+
+    The event log is an ordinary table: a half-written, hand-written or
+    differently-versioned row is exactly the evidence the gate has to read
+    defensively.
+    """
+    assert conn.execute(
+        "UPDATE task_events SET payload = ? WHERE task_id = ? AND kind = 'pr_acceptance'",
+        (json.dumps(payload), impl)).rowcount == 1
+    conn.commit()
+
+
+@pytest.mark.parametrize("shape", sorted(_NONCANONICAL_ACCEPTANCE))
+def test_a_noncanonical_acceptance_receipt_is_no_acceptance_at_all(github, clone, shape):
+    """H2 consumes H1's STRICT canonical acceptance receipt or nothing.
+
+    Every row is otherwise a completable gate — the PR is merged by a human into
+    the configured branch and QA passed on this exact head — so if the verdict
+    were read truthily each of these would complete the gate and promote its
+    downstream card on a head GitHub acceptance never passed.
+    """
+    with connect_closing() as conn:
+        impl = _accepted_implementation(conn, github)
+        _rewrite_acceptance(conn, impl, _NONCANONICAL_ACCEPTANCE[shape])
+        qa = _passing_qa(conn, impl)
+        gate_id = _gate(conn, clone, impl, qa)
+        child = kb.create_task(conn, title="Downstream implementation")
+        kb.link_tasks(conn, gate_id, child)
+        github.merge(clone.commit("squash merge of #7"))
+        before = kb.get_task(conn, gate_id).status
+
+        assert kb.complete_task(conn, gate_id, summary="gate completion") is False
+
+        gate_task = kb.get_task(conn, gate_id)
+        # The gate does not complete and nothing downstream becomes executable.
+        assert gate_task.status == before != "done"
+        assert kb.get_task(conn, child).status == "todo"
+        # No card is pinned to a PR off the back of a receipt H1 never wrote:
+        # the gate's own contract names no pull request and the implementation
+        # is still pinned to the one it published.
+        assert pra._PR.fullmatch(gate_task.completion_contract or "") is None
+        assert kb.get_task(conn, impl).completion_contract == PR_URL
+        # The structured refusal is persisted, on the receipt and on the card.
+        assert f"Integration gate {_ACCEPTED_HEAD}:" in gate_task.last_failure_error
+        receipt = _receipt(conn, gate_id)
+
+    assert receipt["ok"] is False and receipt["phase"] == _ACCEPTED_HEAD
+    assert _condition(receipt, _ACCEPTED_HEAD)["ok"] is False
+    # Nothing is projected out of a payload that is not an acceptance receipt,
+    # and the condition that binds the PR is never reached, so none is bound.
+    assert receipt["accepted_head_sha"] is None and receipt["pr_url"] is None
+    assert [c["name"] for c in receipt["conditions"]][-1] == _ACCEPTED_HEAD
+    assert "implementation_pr_pinned" not in [c["name"] for c in receipt["conditions"]]
+
+
+def test_the_canonical_acceptance_receipt_is_the_shape_the_gate_accepts(github, clone):
+    """The positive control for the refusals above: the same harness, the same
+    hand-written event, with H1's exact verdict triple — and the gate completes."""
+    with connect_closing() as conn:
+        impl = _accepted_implementation(conn, github)
+        _rewrite_acceptance(conn, impl, _CANONICAL_ACCEPTANCE)
+        qa = _passing_qa(conn, impl)
+        gate_id = _gate(conn, clone, impl, qa)
+        child = kb.create_task(conn, title="Downstream implementation")
+        kb.link_tasks(conn, gate_id, child)
+        merge_sha = clone.commit("squash merge of #7")
+        github.merge(merge_sha)
+
+        assert kb.complete_task(conn, gate_id, summary="gate completion") is True
+        assert kb.get_task(conn, gate_id).status == "done"
+        assert kb.get_task(conn, child).status == "ready"
+        receipt = _receipt(conn, gate_id)
+
+    assert receipt["ok"] and receipt["phase"] == "integrated"
+    assert receipt["accepted_head_sha"] == HEAD and receipt["pr_url"] == PR_URL
+    assert receipt["merge_commit_sha"] == merge_sha
+    assert all(c["ok"] for c in receipt["conditions"])
+
+
 def test_a_failed_gate_leaves_diagnostics_without_making_anything_executable(github, clone):
     """The mandate's core safety property: a refusal is auditable and inert."""
     with connect_closing() as conn:
