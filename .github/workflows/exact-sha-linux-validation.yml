@@ -42,7 +42,6 @@ jobs:
 
       - name: Run canonical Linux acceptance tests
         run: |
-          source .venv/bin/activate
           scripts/run_tests.sh --files tests/hermes_cli/test_kanban_pr_acceptance.py
         env:
           HERMES_TEST_WORKERS: 1
